@@ -11,21 +11,39 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
+#include <system_error>
+#include <thread>
+#include <utility>
 
 namespace tagsearch::treeview {
 namespace {
 
 using Microsoft::WRL::ComPtr;
 constexpr wchar_t kWindowClass[] = L"TagSearchTreeView";
+constexpr wchar_t kMutexName[] = L"Local\\TagSearch.TreeView.391B8D68-6A89-4B0A-8C47-DFFA52EB7FA3";
+constexpr wchar_t kWindowTitle[] = L"TagSearch · TreeView";
+constexpr wchar_t kScanningTitle[] = L"TagSearch · TreeView — 正在读取标签…";
+constexpr wchar_t kScanFailedTitle[] = L"TagSearch · TreeView — 无法读取标签";
+constexpr UINT kActivate = WM_APP + 1;
+constexpr UINT kScanComplete = WM_APP + 2;
 constexpr wchar_t kAppId[] = L"MyCustom.HookTool.X";
 constexpr int kOpenTag = 1;
 constexpr int kHideTag = 2;
+
+struct StartupScan {
+    Folders folders;
+    Tags tags;
+    bool succeeded = false;
+};
 
 struct WindowState {
     Folders folders;
     Tags tags;
     HWND tree = nullptr;
     HFONT font = nullptr;
+    StartupScan startupScan;
+    std::jthread scanner;
 
     ~WindowState() {
         if (font) {
@@ -129,6 +147,45 @@ void SearchItem(HWND window, const WindowState& state, HTREEITEM item) {
     }
 }
 
+void PopulateTree(WindowState& state) {
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = TVI_ROOT;
+    // Inserting in reverse at the front avoids repeatedly walking the sibling list.
+    insert.hInsertAfter = TVI_FIRST;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+    SendMessageW(state.tree, WM_SETREDRAW, FALSE, 0);
+    for (std::size_t count = state.tags.size(); count > 0; --count) {
+        const std::size_t i = count - 1;
+        insert.item.pszText = state.tags[i].data();
+        insert.item.lParam = static_cast<LPARAM>(i);
+        TreeView_InsertItem(state.tree, &insert);
+    }
+    SendMessageW(state.tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(state.tree, nullptr, TRUE);
+}
+
+void ActivateWindow(HWND window, HWND tree) {
+    if (IsIconic(window)) ShowWindow(window, SW_RESTORE);
+    SetWindowPos(window, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (SetForegroundWindow(window)) SetFocus(tree);
+}
+
+void ScanOnStartup(HWND window, StartupScan& scan, std::stop_token stop) {
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        try {
+            scan.folders = ResolveSearchFolders(GetCommandLineW());
+            scan.tags = ScanTags(scan.folders, stop);
+            scan.succeeded = !stop.stop_requested();
+            if (scan.succeeded) RegisterAppShortcut();
+        } catch (...) {
+            scan.succeeded = false;
+        }
+        CoUninitialize();
+    }
+    if (!stop.stop_requested()) PostMessageW(window, kScanComplete, 0, 0);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_NCCREATE) {
         const auto create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
@@ -148,19 +205,27 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         UpdateFont(window, *state);
         LayoutTree(window, *state);
 
-        TVINSERTSTRUCTW insert{};
-        insert.hParent = TVI_ROOT;
-        // Inserting in reverse at the front avoids repeatedly walking the sibling list.
-        insert.hInsertAfter = TVI_FIRST;
-        insert.item.mask = TVIF_TEXT | TVIF_PARAM;
-        for (std::size_t count = state->tags.size(); count > 0; --count) {
-            const std::size_t i = count - 1;
-            insert.item.pszText = state->tags[i].data();
-            insert.item.lParam = static_cast<LPARAM>(i);
-            TreeView_InsertItem(state->tree, &insert);
-        }
         return 0;
     }
+    case kScanComplete:
+        if (state->scanner.joinable()) {
+            state->scanner.join();
+            if (state->startupScan.succeeded) {
+                state->folders = std::move(state->startupScan.folders);
+                state->tags = std::move(state->startupScan.tags);
+                PopulateTree(*state);
+                SetWindowTextW(window, kWindowTitle);
+            } else {
+                SetWindowTextW(window, kScanFailedTitle);
+            }
+        }
+        return 0;
+    case kActivate:
+        ActivateWindow(window, state->tree);
+        return 0;
+    case WM_MOUSEACTIVATE:
+        // Keep normal click-to-focus, including keyboard navigation after a click.
+        return HIWORD(lParam) == WM_MOUSEMOVE ? MA_NOACTIVATE : MA_ACTIVATE;
     case WM_SIZE:
         LayoutTree(window, *state);
         return 0;
@@ -210,6 +275,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     }
     case WM_DESTROY:
+        state->scanner.request_stop();
         PostQuitMessage(0);
         return 0;
     }
@@ -221,10 +287,7 @@ int Run(HINSTANCE instance, int showCommand) {
     const INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_TREEVIEW_CLASSES};
     if (!InitCommonControlsEx(&controls)) return 1;
 
-    RegisterAppShortcut();
     WindowState state;
-    state.folders = ResolveSearchFolders(GetCommandLineW());
-    state.tags = ScanTags(state.folders);
 
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
@@ -240,20 +303,73 @@ int Run(HINSTANCE instance, int showCommand) {
     const auto& work = monitor.rcWork;
     const int width = std::min(MulDiv(350, GetDpiForSystem(), USER_DEFAULT_SCREEN_DPI),
                                static_cast<int>(work.right - work.left));
-    const HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"TagSearch · TreeView",
+    // Keep the owner hidden and create the panel as its owned popup.
+    constexpr DWORD toolStyles = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    const HWND owner = CreateWindowExW(toolStyles, L"STATIC", nullptr, WS_POPUP,
+        0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    if (!owner) return 1;
+
+    const HWND window = CreateWindowExW(toolStyles, kWindowClass, kScanningTitle,
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
         work.right - width, work.top, width, work.bottom - work.top,
-        nullptr, nullptr, instance, &state);
-    if (!window) return 1;
+        owner, nullptr, instance, &state);
+    if (!window) {
+        DestroyWindow(owner);
+        return 1;
+    }
 
     ShowWindow(window, showCommand);
+    ActivateWindow(window, state.tree);
+    try {
+        state.scanner = std::jthread([window, &state](std::stop_token stop) {
+            ScanOnStartup(window, state.startupScan, stop);
+        });
+    } catch (const std::system_error&) {
+        SetWindowTextW(window, kScanFailedTitle);
+    }
+
     MSG message{};
     BOOL result;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    DestroyWindow(owner);
     return result < 0 ? 1 : static_cast<int>(message.wParam);
+}
+
+int RunSingleInstance(HINSTANCE instance, int showCommand) {
+    HANDLE rawMutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    const DWORD mutexStatus = GetLastError();
+    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(rawMutex, &CloseHandle);
+    if (!mutex) return 1;
+
+    if (mutexStatus == ERROR_ALREADY_EXISTS) {
+        const ULONGLONG deadline = GetTickCount64() + 5000;
+        for (;;) {
+            const DWORD wait = WaitForSingleObject(mutex.get(), 0);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) break;
+            if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) return 1;
+
+            if (const HWND existing = FindWindowW(kWindowClass, nullptr)) {
+                DWORD processId = 0;
+                if (GetWindowThreadProcessId(existing, &processId)) {
+                    // A shell-launched copy can transfer its foreground privilege to the owner.
+                    AllowSetForegroundWindow(processId);
+                    if (PostMessageW(existing, kActivate, 0, 0)) return 0;
+                }
+            }
+            Sleep(25);
+        }
+    }
+
+    int result = 1;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        result = Run(instance, showCommand);
+        CoUninitialize();
+    }
+    ReleaseMutex(mutex.get());
+    return result;
 }
 
 } // namespace
@@ -261,8 +377,5 @@ int Run(HINSTANCE instance, int showCommand) {
 
 _Use_decl_annotations_
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
-    const int result = tagsearch::treeview::Run(instance, showCommand);
-    CoUninitialize();
-    return result;
+    return tagsearch::treeview::RunSingleInstance(instance, showCommand);
 }

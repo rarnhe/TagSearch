@@ -157,11 +157,11 @@ Folders ResolveSearchFolders(const wchar_t* commandLine) {
     return folders;
 }
 
-Tags ScanTags(const Folders& folders) {
+Tags ScanTags(const Folders& folders, std::stop_token stop) {
     Tags tags;
     Folders pending = folders;
     std::set<fs::path> visited;
-    while (!pending.empty()) {
+    while (!pending.empty() && !stop.stop_requested()) {
         auto folder = std::move(pending.back());
         pending.pop_back();
         if (!visited.insert(folder).second) {
@@ -171,7 +171,7 @@ Tags ScanTags(const Folders& folders) {
         ReadItemTags(folder, tags);
         std::error_code error;
         for (fs::directory_iterator entry(folder, fs::directory_options::skip_permission_denied, error), end;
-             !error && entry != end; entry.increment(error)) {
+             !error && entry != end && !stop.stop_requested(); entry.increment(error)) {
             const auto& path = entry->path();
             const DWORD attributes = GetFileAttributesW(path.c_str());
             if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -199,7 +199,7 @@ Tags ScanTags(const Folders& folders) {
             pending.push_back(path);
         }
     }
-    return NormalizeTags(std::move(tags));
+    return stop.stop_requested() ? Tags{} : NormalizeTags(std::move(tags));
 }
 
 Tags TagsForOverlappingWindows(

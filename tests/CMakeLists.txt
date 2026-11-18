@@ -29,3 +29,12 @@ foreach(case IN LISTS cases)
     add_test(NAME ${case} COMMAND tagsearch_tests ${case})
     set_tests_properties(${case} PROPERTIES TIMEOUT 20 RUN_SERIAL TRUE)
 endforeach()
+
+add_executable(tagsearch_treeview_startup_test test_treeview_startup.cpp)
+target_link_libraries(tagsearch_treeview_startup_test PRIVATE TagSearchCore)
+target_compile_options(tagsearch_treeview_startup_test PRIVATE /utf-8)
+add_dependencies(tagsearch_treeview_startup_test TagSearch_TreeView)
+
+add_test(NAME treeview_single_instance_startup
+         COMMAND tagsearch_treeview_startup_test $<TARGET_FILE:TagSearch_TreeView>)
+set_tests_properties(treeview_single_instance_startup PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
