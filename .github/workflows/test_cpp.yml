@@ -32,12 +32,14 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           New-Item -ItemType Directory -Force out/test-logs | Out-Null
-          cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON "-DCMAKE_CXX_FLAGS=/analyze /we28251" 2>&1 | Tee-Object out/test-logs/configure.log
+          cmake -S . -B out/test -A x64 -DBUILD_TESTING=ON 2>&1 | Tee-Object out/test-logs/configure.log
           "Exit code: $LASTEXITCODE" | Add-Content out/test-logs/configure.log
           exit $LASTEXITCODE
 
       - name: Build application and tests
         id: build
+        env:
+          _CL_: /analyze /we28251
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
