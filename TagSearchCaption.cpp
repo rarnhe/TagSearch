@@ -13,8 +13,8 @@ constexpr wchar_t kPanelClass[] = L"TagSearchCaption";
 constexpr wchar_t kTagClass[] = L"TagSearchFloatingTag";
 constexpr UINT kRefresh = WM_APP + 1;
 constexpr UINT kReflow = WM_APP + 2;
-constexpr int kPrevious = 1;
-constexpr int kNext = 2;
+constexpr INT_PTR kPrevious = 1;
+constexpr INT_PTR kNext = 2;
 
 struct Panel;
 
@@ -275,7 +275,7 @@ void LayoutTags(Panel& panel) {
     AdjustWindowRectExForDpi(&frame, style, FALSE, WS_EX_TOOLWINDOW, dpi);
     const int cellHeight = frame.bottom - frame.top;
     const int top = std::min(work.top + Scale(122, dpi), work.bottom - cellHeight - gap);
-    const int rows = std::max(1, (work.bottom - top) / (cellHeight + gap));
+    const int rows = std::max(1, (static_cast<int>(work.bottom) - top) / (cellHeight + gap));
     const int columns = std::max(1, int(work.right - work.left - gap) / (cellWidth + gap));
     // Reserve the first slot for refresh. Leave at least one additional slot on small displays.
     const std::size_t capacity = static_cast<std::size_t>(std::max(1, rows * columns - 1));
