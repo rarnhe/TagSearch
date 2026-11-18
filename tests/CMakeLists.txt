@@ -7,6 +7,7 @@ add_executable(tagsearch_tests
     ../TagSearchCore.cpp
 )
 target_compile_features(tagsearch_tests PRIVATE cxx_std_20)
+target_include_directories(tagsearch_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 if(MSVC)
     target_compile_options(tagsearch_tests PRIVATE /utf-8)
 endif()
