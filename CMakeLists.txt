@@ -2,28 +2,22 @@ cmake_minimum_required(VERSION 3.20)
 
 project(TagSearch LANGUAGES CXX)
 
-add_executable(TagSearch WIN32
-    TagSearch.cpp
-    TagSearch.h
-    TagSearchCore.cpp
-    TagSearchCore.h
-)
+add_library(TagSearchCore STATIC TagSearchCore.cpp TagSearchCore.h)
+target_include_directories(TagSearchCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(TagSearchCore PUBLIC cxx_std_20)
+target_compile_definitions(TagSearchCore PUBLIC UNICODE _UNICODE NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+target_link_libraries(TagSearchCore PUBLIC shell32 ole32 propsys uuid structuredquery)
 
-target_compile_features(TagSearch PRIVATE cxx_std_20)
-target_compile_definitions(TagSearch PRIVATE UNICODE _UNICODE)
-target_link_libraries(TagSearch PRIVATE
-    comctl32
-    propsys
-    shlwapi
-    shell32
-    ole32
-    oleaut32
-    uuid
-    windowsapp
-)
+add_executable(TagSearch_TreeView WIN32 TagSearchTreeView.cpp TagSearchTreeView.h)
+target_link_libraries(TagSearch_TreeView PRIVATE TagSearchCore comctl32 shlwapi)
+
+add_executable(TagSearch_Caption WIN32 TagSearchCaption.cpp)
+target_link_libraries(TagSearch_Caption PRIVATE TagSearchCore dwmapi)
 
 if(MSVC)
-    target_compile_options(TagSearch PRIVATE /utf-8)
+    target_compile_options(TagSearchCore PRIVATE /utf-8)
+    target_compile_options(TagSearch_TreeView PRIVATE /utf-8)
+    target_compile_options(TagSearch_Caption PRIVATE /utf-8)
 endif()
 
 include(CTest)

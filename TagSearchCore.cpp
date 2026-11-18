@@ -1,15 +1,76 @@
 #include "TagSearchCore.h"
 
+#include <propkey.h>
+#include <propsys.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <structuredquery.h>
+#include <wrl/client.h>
+
 #include <algorithm>
 #include <cwctype>
+#include <iterator>
 #include <locale>
+#include <memory>
+#include <type_traits>
 #include <set>
 #include <utility>
 
 namespace tagsearch {
 namespace {
 
-constexpr std::wstring_view kDesktopIniTagsPrefix = L"Prop5=31,";
+using Microsoft::WRL::ComPtr;
+namespace fs = std::filesystem;
+
+template<typename T>
+using TaskMemory = std::unique_ptr<T, decltype(&CoTaskMemFree)>;
+
+using Pidl = TaskMemory<std::remove_pointer_t<PIDLIST_ABSOLUTE>>;
+
+void AddFolder(Folders& folders, const fs::path& candidate) {
+    if (candidate.empty()) {
+        return;
+    }
+
+    std::error_code error;
+    auto folder = fs::canonical(candidate, error);
+    if (!error && fs::is_directory(folder, error) &&
+        std::find(folders.begin(), folders.end(), folder) == folders.end()) {
+        folders.push_back(std::move(folder));
+    }
+}
+
+void AddKnownFolder(Folders& folders, REFKNOWNFOLDERID id) {
+    PWSTR path = nullptr;
+    const HRESULT hr = SHGetKnownFolderPath(id, 0, nullptr, &path);
+    const TaskMemory<wchar_t> memory(path, &CoTaskMemFree);
+    if (SUCCEEDED(hr)) {
+        AddFolder(folders, path);
+    }
+}
+
+void ReadItemTags(const fs::path& item, Tags& tags) {
+    ComPtr<IPropertyStore> store;
+    if (FAILED(SHGetPropertyStoreFromParsingName(
+            item.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(store.GetAddressOf())))) {
+        return;
+    }
+
+    PROPVARIANT value{};
+    if (SUCCEEDED(store->GetValue(PKEY_Keywords, &value))) {
+        if (value.vt == (VT_VECTOR | VT_LPWSTR)) {
+            for (ULONG i = 0; i < value.calpwstr.cElems; ++i) {
+                if (const auto keyword = value.calpwstr.pElems[i]) {
+                    tags.emplace_back(keyword);
+                }
+            }
+        } else if (value.vt == VT_LPWSTR && value.pwszVal) {
+            const auto keywords = SplitKeywords(value.pwszVal);
+            tags.insert(tags.end(), keywords.begin(), keywords.end());
+        }
+    }
+    PropVariantClear(&value);
+}
 
 std::wstring TrimWhitespace(std::wstring_view value) {
     std::size_t first = 0;
@@ -82,86 +143,130 @@ std::vector<std::wstring> NormalizeTags(std::vector<std::wstring> tags) {
     return normalized;
 }
 
-std::optional<std::vector<std::wstring>> ParseDesktopIniTagsLine(std::wstring_view line) {
-    const std::size_t prefix = line.find(kDesktopIniTagsPrefix);
-    if (prefix == std::wstring_view::npos) {
-        return std::nullopt;
-    }
+Folders ResolveSearchFolders(const wchar_t* commandLine) {
+    Folders folders;
+    AddKnownFolder(folders, FOLDERID_Desktop);
+    AddKnownFolder(folders, FOLDERID_Downloads);
 
-    return SplitKeywords(line.substr(prefix + kDesktopIniTagsPrefix.size()));
+    int count = 0;
+    const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
+        CommandLineToArgvW(commandLine, &count), &LocalFree);
+    for (int i = 1; arguments && i < count; ++i) {
+        AddFolder(folders, arguments.get()[i]);
+    }
+    return folders;
 }
 
-std::wstring FormatDesktopIniTagsLine(const std::vector<std::wstring>& tags) {
-    std::wstring line(kDesktopIniTagsPrefix);
-    bool first = true;
-
-    for (const auto& rawTag : tags) {
-        const std::wstring tag = TrimWhitespace(rawTag);
-        if (tag.empty()) {
+Tags ScanTags(const Folders& folders) {
+    Tags tags;
+    Folders pending = folders;
+    std::set<fs::path> visited;
+    while (!pending.empty()) {
+        auto folder = std::move(pending.back());
+        pending.pop_back();
+        if (!visited.insert(folder).second) {
             continue;
         }
 
-        if (!first) {
-            line.push_back(L';');
-        }
-        line += tag;
-        first = false;
-    }
+        ReadItemTags(folder, tags);
+        std::error_code error;
+        for (fs::directory_iterator entry(folder, fs::directory_options::skip_permission_denied, error), end;
+             !error && entry != end; entry.increment(error)) {
+            const auto& path = entry->path();
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                continue;
+            }
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                ReadItemTags(path, tags);
+                continue;
+            }
 
-    return line;
+            // Cloud placeholders may have a reparse tag. Skip name surrogates
+            // (junctions and directory symlinks) so traversal stays in scope.
+            WIN32_FIND_DATAW data{};
+            const HANDLE find = (attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                ? FindFirstFileW(path.c_str(), &data) : INVALID_HANDLE_VALUE;
+            if (find != INVALID_HANDLE_VALUE) {
+                FindClose(find);
+                constexpr DWORD nameSurrogateBit = 0x20000000;
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                    (data.dwReserved0 & nameSurrogateBit)) {
+                    ReadItemTags(path, tags);
+                    continue;
+                }
+            }
+            pending.push_back(path);
+        }
+    }
+    return NormalizeTags(std::move(tags));
 }
 
-std::wstring UpdateDesktopIniTagsLine(
-    std::wstring_view content,
-    const std::vector<std::wstring>& tags) {
-    const std::wstring replacement = FormatDesktopIniTagsLine(tags);
-    const std::wstring newline =
-        content.find(L"\r\n") != std::wstring_view::npos ? L"\r\n" : L"\n";
-
-    std::wstring updated;
-    bool replaced = false;
-    std::size_t cursor = 0;
-
-    while (cursor < content.size()) {
-        const std::size_t lineEnd = content.find_first_of(L"\r\n", cursor);
-        const std::size_t textEnd =
-            lineEnd == std::wstring_view::npos ? content.size() : lineEnd;
-        const std::wstring_view line = content.substr(cursor, textEnd - cursor);
-
-        if (!replaced && line.find(kDesktopIniTagsPrefix) != std::wstring_view::npos) {
-            updated += replacement;
-            replaced = true;
-        }
-        else {
-            updated.append(line);
-        }
-
-        if (lineEnd == std::wstring_view::npos) {
-            cursor = content.size();
-            break;
-        }
-
-        if (content[lineEnd] == L'\r' &&
-            lineEnd + 1 < content.size() &&
-            content[lineEnd + 1] == L'\n') {
-            updated += L"\r\n";
-            cursor = lineEnd + 2;
-        }
-        else {
-            updated.push_back(content[lineEnd]);
-            cursor = lineEnd + 1;
-        }
+HRESULT CreateTagSearchFolder(
+    const std::wstring& tag, const Folders& folders, PIDLIST_ABSOLUTE* result) {
+    if (!result) return E_POINTER;
+    *result = nullptr;
+    if (tag.empty()) {
+        return E_INVALIDARG;
     }
 
-    if (!replaced) {
-        if (!updated.empty() && updated.back() != L'\n' && updated.back() != L'\r') {
-            updated += newline;
+    std::vector<Pidl> items;
+    std::vector<PCIDLIST_ABSOLUTE> ids;
+    for (const auto& folder : folders) {
+        PIDLIST_ABSOLUTE id = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &id, 0, nullptr))) {
+            items.emplace_back(id, &CoTaskMemFree);
+            ids.push_back(id);
         }
-        updated += replacement;
-        updated += newline;
+    }
+    if (ids.empty()) {
+        return E_INVALIDARG;
     }
 
-    return updated;
+    ComPtr<IShellItemArray> scope;
+    HRESULT hr = SHCreateShellItemArrayFromIDLists(
+        static_cast<UINT>(ids.size()), ids.data(), scope.GetAddressOf());
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    ComPtr<IConditionFactory2> conditions;
+    hr = CoCreateInstance(CLSID_ConditionFactory, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(conditions.GetAddressOf()));
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    ComPtr<ICondition> condition;
+    hr = conditions->CreateStringLeaf(PKEY_Keywords, COP_EQUAL, tag.c_str(), nullptr,
+                                      CONDITION_CREATION_NONE, IID_PPV_ARGS(condition.GetAddressOf()));
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    ComPtr<ISearchFolderItemFactory> search;
+    hr = CoCreateInstance(CLSID_SearchFolderItemFactory, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(search.GetAddressOf()));
+    if (SUCCEEDED(hr)) hr = search->SetDisplayName(tag.c_str());
+    if (SUCCEEDED(hr)) hr = search->SetScope(scope.Get());
+    if (SUCCEEDED(hr)) hr = search->SetCondition(condition.Get());
+    return SUCCEEDED(hr) ? search->GetIDList(result) : hr;
+}
+
+bool OpenTagSearch(HWND owner, const std::wstring& tag, const Folders& folders) {
+    PIDLIST_ABSOLUTE id = nullptr;
+    const HRESULT hr = CreateTagSearchFolder(tag, folders, &id);
+    const Pidl search(id, &CoTaskMemFree);
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    SHELLEXECUTEINFOW execute{sizeof(execute)};
+    execute.fMask = SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI;
+    execute.hwnd = owner;
+    execute.lpIDList = search.get();
+    execute.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&execute) != FALSE;
 }
 
 } // namespace tagsearch

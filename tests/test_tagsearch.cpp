@@ -1,6 +1,10 @@
 #include "TagSearchCore.h"
 
+#include <shlobj.h>
+
+#include <algorithm>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -58,69 +62,116 @@ void NormalizeTagsDiscardsEmpty() {
         "normalization should not retain empty tags");
 }
 
-void ParseDesktopIniTags() {
-    const auto parsed = tagsearch::ParseDesktopIniTagsLine(
-        L"Prop5=31,alpha; beta ;gamma;");
+namespace fs = std::filesystem;
 
-    Expect(parsed.has_value(), "Prop5=31 line should be recognized");
+struct TestDirectory {
+    fs::path path = fs::temp_directory_path() /
+        (L"TagSearch test " + std::to_wstring(GetCurrentProcessId()) + L" " +
+         std::to_wstring(GetTickCount64()));
+
+    TestDirectory() {
+        fs::create_directory(path);
+    }
+
+    ~TestDirectory() {
+        std::error_code error;
+        fs::remove_all(path, error);
+    }
+};
+
+const fs::path fixturePath = TAGSEARCH_FIXTURE;
+
+void ResolveFoldersKeepsKnownFolders() {
+    const auto defaultFolders = tagsearch::ResolveSearchFolders(L"TagSearch.exe");
+    for (const auto* id : {&FOLDERID_Desktop, &FOLDERID_Downloads}) {
+        PWSTR path = nullptr;
+        const auto result = SHGetKnownFolderPath(*id, 0, nullptr, &path);
+        const fs::path known = path ? fs::path(path) : fs::path();
+        CoTaskMemFree(path);
+        if (SUCCEEDED(result) && fs::is_directory(known)) {
+            const auto folder = fs::canonical(known);
+            Expect(std::find(defaultFolders.begin(), defaultFolders.end(), folder) != defaultFolders.end(),
+                   "existing Windows known folders should be searched by default");
+        }
+    }
+
+    TestDirectory test;
+    const auto command = L"TagSearch.exe \"" + test.path.wstring() + L"\"";
+    const auto combined = tagsearch::ResolveSearchFolders(command.c_str());
+    Expect(combined.size() == defaultFolders.size() + 1 &&
+               std::equal(defaultFolders.begin(), defaultFolders.end(), combined.begin()),
+           "additional folders should extend the known folders");
+}
+
+void ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs() {
+    TestDirectory test;
+    const auto first = test.path / L"中文 & paths";
+    const auto second = test.path / L"second";
+    fs::create_directory(first);
+    fs::create_directory(second);
+    const auto file = test.path / L"not a directory.txt";
+    std::ofstream(file).put('x');
+
+    const auto command = L"\"C:\\Program Files\\TagSearch.exe\" \"" + first.wstring() +
+        L"\" \"" + file.wstring() + L"\" \"" + (test.path / L"absent").wstring() +
+        L"\" \"" + second.wstring() + L"\" \"" + (first / L".").wstring() + L"\" \"\"";
+    const auto folders = tagsearch::ResolveSearchFolders(command.c_str());
+    const auto defaults = tagsearch::ResolveSearchFolders(L"TagSearch.exe");
+    ExpectEqual(folders.size(), defaults.size() + 2, "only valid distinct folders should be added");
+    ExpectEqual(folders[folders.size() - 2], fs::canonical(first), "quoted Unicode path should survive");
+    ExpectEqual(folders.back(), fs::canonical(second), "all command-line directories should be added");
+}
+
+void ScanTagsReadsNestedShellPropertiesWithoutUsingCache() {
+    TestDirectory test;
+    const auto nested = test.path / L"子目录" / L"nested";
+    fs::create_directories(nested);
+    const auto image = nested / L"label & image.jpg";
+    fs::copy_file(fixturePath, image);
+    fs::copy_file(fixturePath, test.path / L"duplicate.jpg");
+    const auto fakeCache = test.path / L"desktop.ini";
+    std::ofstream(fakeCache) << "Prop5=31,stale-cache-tag\r\n";
+
     ExpectEqual(
-        *parsed,
-        std::vector<std::wstring>{L"alpha", L"beta", L"gamma"},
-        "desktop.ini tags should be parsed and trimmed");
-}
+        tagsearch::ScanTags({test.path, nested}),
+        tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"}),
+        "scan should read metadata from nested JPEGs, deduplicate tags and ignore the old cache");
+    Expect(fs::exists(fakeCache), "reading live properties should leave existing files alone");
 
-void ParseDesktopIniMissing() {
-    Expect(
-        !tagsearch::ParseDesktopIniTagsLine(L"[.ShellClassInfo]").has_value(),
-        "unrelated desktop.ini lines should not be parsed as tags");
-}
-
-void FormatDesktopIniTags() {
+    fs::remove(test.path / L"duplicate.jpg");
     ExpectEqual(
-        tagsearch::FormatDesktopIniTagsLine({L"alpha", L"beta"}),
-        std::wstring(L"Prop5=31,alpha;beta"),
-        "desktop.ini tag line should use the expected property prefix");
+        tagsearch::ScanTags({test.path}),
+        tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"}),
+        "a root must reach the JPEG through nested folders");
+    fs::remove(image);
+    Expect(tagsearch::ScanTags({test.path}).empty(), "a new scan should reflect a removed file");
 }
 
-void FormatDesktopIniSkipsEmpty() {
-    ExpectEqual(
-        tagsearch::FormatDesktopIniTagsLine({L" alpha ", L"", L"beta ", L"  "}),
-        std::wstring(L"Prop5=31,alpha;beta"),
-        "desktop.ini serialization should trim and skip empty tags");
+void CreateSearchFolderAcceptsMultipleScopesAndLiteralTag() {
+    TestDirectory test;
+    const auto first = test.path / L"one & 本地";
+    const auto second = test.path / L"two";
+    fs::create_directories(first);
+    fs::create_directories(second);
+    const std::wstring tag = L"项目 & \"归档\" + %";
+    PIDLIST_ABSOLUTE id = nullptr;
+    const auto result = tagsearch::CreateTagSearchFolder(tag, {first, second}, &id);
+    CoTaskMemFree(id);
+    Expect(SUCCEEDED(result) && id != nullptr, "Shell should create a search folder with both scopes and a literal tag");
 }
 
-void UpdateDesktopIniReplacesTagLine() {
-    const std::wstring original =
-        L"[.ShellClassInfo]\nProp5=31,old;older\nOther=keep\n";
-    const std::wstring expected =
-        L"[.ShellClassInfo]\nProp5=31,new\nOther=keep\n";
-
-    ExpectEqual(
-        tagsearch::UpdateDesktopIniTagsLine(original, {L"new"}),
-        expected,
-        "existing Prop5 line should be replaced without losing other settings");
+void CreateSearchFolderRejectsEmptyScope() {
+    PIDLIST_ABSOLUTE id = nullptr;
+    Expect(tagsearch::CreateTagSearchFolder(L"example", {}, &id) == E_INVALIDARG && id == nullptr,
+           "a missing scope must not turn into an unrestricted search");
 }
 
-void UpdateDesktopIniAppendsMissingTagLine() {
-    const std::wstring original = L"[.ShellClassInfo]\nIconResource=icon.dll,0\n";
-    const std::wstring expected =
-        L"[.ShellClassInfo]\nIconResource=icon.dll,0\nProp5=31,new\n";
-
-    ExpectEqual(
-        tagsearch::UpdateDesktopIniTagsLine(original, {L"new"}),
-        expected,
-        "missing Prop5 line should be appended");
-}
-
-void UpdateDesktopIniPreservesWindowsLineEndings() {
-    const std::wstring original = L"Header=1\r\nProp5=31,old\r\n";
-    const std::wstring expected = L"Header=1\r\nProp5=31,new\r\n";
-
-    ExpectEqual(
-        tagsearch::UpdateDesktopIniTagsLine(original, {L"new"}),
-        expected,
-        "existing CRLF line endings should be preserved");
-}
+struct ComApartment {
+    HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    ~ComApartment() {
+        if (SUCCEEDED(result)) CoUninitialize();
+    }
+};
 
 } // namespace
 
@@ -131,13 +182,11 @@ int main(int argc, char** argv) {
         {"split_keywords_ignores_empty", SplitKeywordsIgnoresEmpty},
         {"normalize_tags_deduplicates_and_sorts", NormalizeTagsDeduplicatesAndSorts},
         {"normalize_tags_discards_empty", NormalizeTagsDiscardsEmpty},
-        {"parse_desktop_ini_tags", ParseDesktopIniTags},
-        {"parse_desktop_ini_missing", ParseDesktopIniMissing},
-        {"format_desktop_ini_tags", FormatDesktopIniTags},
-        {"format_desktop_ini_skips_empty", FormatDesktopIniSkipsEmpty},
-        {"update_desktop_ini_replaces_tag_line", UpdateDesktopIniReplacesTagLine},
-        {"update_desktop_ini_appends_missing_tag_line", UpdateDesktopIniAppendsMissingTagLine},
-        {"update_desktop_ini_preserves_windows_line_endings", UpdateDesktopIniPreservesWindowsLineEndings},
+        {"resolve_folders_keeps_known_folders", ResolveFoldersKeepsKnownFolders},
+        {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
+        {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
+        {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
+        {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
     };
 
     if (argc != 2) {
@@ -151,6 +200,8 @@ int main(int argc, char** argv) {
         }
 
         try {
+            const ComApartment com;
+            Expect(SUCCEEDED(com.result), "COM initialization should succeed");
             test();
             std::cout << "[PASS] " << name << '\n';
             return 0;
