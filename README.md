@@ -20,8 +20,8 @@ TagSearch_Caption.exe C:\Work\repos "D:\Project Files"
 
 | 文件 | 职责 |
 | --- | --- |
-| `TagSearchTreeView.cpp/.h` | TreeView 界面、标签交互和开始菜单快捷方式 |
-| `TagSearchCaption.cpp` | 主面板、浮动标签窗口、拖动、布局、DPI 和刷新 |
+| `TagSearch_TreeView.cpp/.h` | TreeView 界面、标签交互和开始菜单快捷方式 |
+| `TagSearch_Caption.cpp` | 主面板、浮动标签窗口、拖动、布局、DPI 和刷新 |
 | `TagSearchCore.cpp/.h` | Unicode 命令行、默认目录、递归扫描、标签规范化和 Explorer 搜索 |
 | `tests/` | CTest 测试和 Markdown 报告生成 |
 | `.github/workflows/test_cpp.yml` | Windows 双轨验证，构建两个 EXE，运行 CTest 并生成报告 |
