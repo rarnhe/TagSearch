@@ -202,13 +202,59 @@ Tags ScanTags(const Folders& folders) {
     return NormalizeTags(std::move(tags));
 }
 
-HRESULT CreateTagSearchFolder(
-    const std::wstring& tag, const Folders& folders, PIDLIST_ABSOLUTE* result) {
+Tags TagsForOverlappingWindows(
+    const TagWindowBounds& selected, const std::vector<TagWindowBounds>& visibleWindows) {
+    Tags tags{std::wstring(selected.tag)};
+    for (const auto& candidate : visibleWindows) {
+        RECT intersection{};
+        if (IntersectRect(&intersection, &selected.bounds, &candidate.bounds) &&
+            std::find(tags.begin(), tags.end(), candidate.tag) == tags.end()) {
+            tags.emplace_back(candidate.tag);
+        }
+    }
+    return tags;
+}
+
+HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result) {
     if (!result) return E_POINTER;
     *result = nullptr;
-    if (tag.empty()) {
+    if (tags.empty() || std::any_of(tags.begin(), tags.end(), [](const auto& tag) { return tag.empty(); })) {
         return E_INVALIDARG;
     }
+
+    ComPtr<IConditionFactory2> factory;
+    HRESULT hr = CoCreateInstance(CLSID_ConditionFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.GetAddressOf()));
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    std::vector<ComPtr<ICondition>> leaves;
+    std::vector<ICondition*> children;
+    leaves.reserve(tags.size());
+    children.reserve(tags.size());
+    for (const auto& tag : tags) {
+        auto& leaf = leaves.emplace_back();
+        hr = factory->CreateStringLeaf(PKEY_Keywords, COP_EQUAL, tag.c_str(), nullptr,
+                                       CONDITION_CREATION_NONE, IID_PPV_ARGS(leaf.GetAddressOf()));
+        if (FAILED(hr)) {
+            return hr;
+        }
+        children.push_back(leaf.Get());
+    }
+
+    if (leaves.size() == 1) {
+        *result = leaves.front().Detach();
+        return S_OK;
+    }
+    return factory->CreateCompoundFromArray(CT_AND_CONDITION, children.data(),
+                                            static_cast<ULONG>(children.size()),
+                                            CONDITION_CREATION_NONE, IID_PPV_ARGS(result));
+}
+
+HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result) {
+    if (!result) return E_POINTER;
+    *result = nullptr;
 
     std::vector<Pidl> items;
     std::vector<PCIDLIST_ABSOLUTE> ids;
@@ -230,32 +276,29 @@ HRESULT CreateTagSearchFolder(
         return hr;
     }
 
-    ComPtr<IConditionFactory2> conditions;
-    hr = CoCreateInstance(CLSID_ConditionFactory, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_PPV_ARGS(conditions.GetAddressOf()));
+    ComPtr<ICondition> condition;
+    hr = CreateTagSearchCondition(tags, condition.GetAddressOf());
     if (FAILED(hr)) {
         return hr;
     }
 
-    ComPtr<ICondition> condition;
-    hr = conditions->CreateStringLeaf(PKEY_Keywords, COP_EQUAL, tag.c_str(), nullptr,
-                                      CONDITION_CREATION_NONE, IID_PPV_ARGS(condition.GetAddressOf()));
-    if (FAILED(hr)) {
-        return hr;
+    std::wstring name = tags.front();
+    for (std::size_t i = 1; i < tags.size(); ++i) {
+        name += L" AND " + tags[i];
     }
 
     ComPtr<ISearchFolderItemFactory> search;
     hr = CoCreateInstance(CLSID_SearchFolderItemFactory, nullptr, CLSCTX_INPROC_SERVER,
                           IID_PPV_ARGS(search.GetAddressOf()));
-    if (SUCCEEDED(hr)) hr = search->SetDisplayName(tag.c_str());
+    if (SUCCEEDED(hr)) hr = search->SetDisplayName(name.c_str());
     if (SUCCEEDED(hr)) hr = search->SetScope(scope.Get());
     if (SUCCEEDED(hr)) hr = search->SetCondition(condition.Get());
     return SUCCEEDED(hr) ? search->GetIDList(result) : hr;
 }
 
-bool OpenTagSearch(HWND owner, const std::wstring& tag, const Folders& folders) {
+bool OpenTagSearch(HWND owner, const Tags& tags, const Folders& folders) {
     PIDLIST_ABSOLUTE id = nullptr;
-    const HRESULT hr = CreateTagSearchFolder(tag, folders, &id);
+    const HRESULT hr = CreateTagSearchFolder(tags, folders, &id);
     const Pidl search(id, &CoTaskMemFree);
     if (FAILED(hr)) {
         return false;

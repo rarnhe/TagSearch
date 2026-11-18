@@ -151,7 +151,7 @@ if ($LogDirectory) {
 
 $lines.Add("")
 $lines.Add("## 自动测试覆盖范围")
-$lines.Add("验证标签拆分、空白清理、去重与排序、默认目录和带引号的 Unicode 路径、从嵌套 JPEG 读取真实 System.Keywords 属性、重新扫描后的变化，以及 Windows Shell 的多目录搜索对象创建。")
+$lines.Add("验证标签拆分、空白清理、去重与排序、默认目录和带引号的 Unicode 路径、从嵌套 JPEG 读取真实 System.Keywords 属性、重新扫描后的变化，窗口重叠判断（含边缘接触和间接重叠），以及 Windows Shell 多目录和多标签 AND 搜索条件的创建。")
 $lines.Add("")
 $lines.Add("## 人工验证边界")
 $lines.Add("Windows CI 构建 TreeView 和 Caption 两个 EXE。窗口拖动、DPI、主题及 Explorer 实际返回的搜索结果需要在交互式 Windows 桌面验证。")

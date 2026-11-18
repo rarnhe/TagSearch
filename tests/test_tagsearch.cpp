@@ -1,6 +1,9 @@
 #include "TagSearchCore.h"
 
+#include <propvarutil.h>
 #include <shlobj.h>
+#include <structuredquery.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <exception>
@@ -155,15 +158,115 @@ void CreateSearchFolderAcceptsMultipleScopesAndLiteralTag() {
     fs::create_directories(second);
     const std::wstring tag = L"项目 & \"归档\" + %";
     PIDLIST_ABSOLUTE id = nullptr;
-    const auto result = tagsearch::CreateTagSearchFolder(tag, {first, second}, &id);
+    const auto result = tagsearch::CreateTagSearchFolder({tag}, {first, second}, &id);
+    const bool created = SUCCEEDED(result) && id != nullptr;
     CoTaskMemFree(id);
-    Expect(SUCCEEDED(result) && id != nullptr, "Shell should create a search folder with both scopes and a literal tag");
+    Expect(created, "Shell should create a search folder with both scopes and a literal tag");
 }
 
 void CreateSearchFolderRejectsEmptyScope() {
     PIDLIST_ABSOLUTE id = nullptr;
-    Expect(tagsearch::CreateTagSearchFolder(L"example", {}, &id) == E_INVALIDARG && id == nullptr,
+    Expect(tagsearch::CreateTagSearchFolder({L"example"}, {}, &id) == E_INVALIDARG && id == nullptr,
            "a missing scope must not turn into an unrestricted search");
+}
+
+void OverlapFindsAllDirectIntersections() {
+    const tagsearch::TagWindowBounds selected{{-40, 0, 60, 40}, L"A"};
+    const std::vector<tagsearch::TagWindowBounds> visible{
+        selected,
+        {{30, 0, 90, 40}, L"B"},
+        {{70, 0, 110, 40}, L"chain-only"},
+        {{-100, 10, -20, 30}, L"C"},
+        {{30, 0, 90, 40}, L"B"},
+    };
+    ExpectEqual(tagsearch::TagsForOverlappingWindows(selected, visible),
+                tagsearch::Tags{L"A", L"B", L"C"},
+                "each directly overlapping tag should occur once, including on negative coordinates");
+}
+
+void OverlapIgnoresTouchingEdgesAndCorners() {
+    const tagsearch::TagWindowBounds selected{{0, 0, 100, 100}, L"A"};
+    const std::vector<tagsearch::TagWindowBounds> visible{
+        {{100, 0, 130, 50}, L"edge"},
+        {{100, 100, 130, 130}, L"corner"},
+        {{20, 0, 20, 80}, L"empty"},
+        {{110, 0, 150, 50}, L"separate"},
+    };
+    ExpectEqual(tagsearch::TagsForOverlappingWindows(selected, visible), tagsearch::Tags{L"A"},
+                "the selected tag should remain a single-tag search when there is no common area");
+}
+
+std::wstring ExactKeyword(ICondition& condition) {
+    LPWSTR property = nullptr;
+    CONDITION_OPERATION operation{};
+    PROPVARIANT value{};
+    const auto hr = condition.GetComparisonInfo(&property, &operation, &value);
+    LPWSTR keyword = nullptr;
+    const auto converted = PropVariantToStringAlloc(value, &keyword);
+    const bool exactKeyword = SUCCEEDED(hr) && SUCCEEDED(converted) &&
+        property && std::wstring_view(property) == L"System.Keywords" &&
+        operation == COP_EQUAL && keyword;
+    const std::wstring result = keyword ? keyword : L"";
+    CoTaskMemFree(keyword);
+    CoTaskMemFree(property);
+    PropVariantClear(&value);
+    Expect(exactKeyword, "each leaf must be an exact System.Keywords comparison");
+    return result;
+}
+
+void SearchConditionKeepsOneTagLiteral() {
+    const std::wstring literal = L"A AND B";
+    Microsoft::WRL::ComPtr<ICondition> condition;
+    Expect(SUCCEEDED(tagsearch::CreateTagSearchCondition({literal}, condition.GetAddressOf())),
+           "a single tag should create a Shell condition");
+    CONDITION_TYPE type{};
+    Expect(SUCCEEDED(condition->GetConditionType(&type)) && type == CT_LEAF_CONDITION,
+           "a single tag must remain a single leaf");
+    ExpectEqual(ExactKeyword(*condition.Get()), literal, "AND inside a label must remain part of the tag");
+}
+
+void SearchConditionCombinesAllTagsWithAnd() {
+    const tagsearch::TagWindowBounds selected{{0, 0, 4, 4}, L"项目 & \"资料\""};
+    const auto tags = tagsearch::TagsForOverlappingWindows(selected, {
+        {{0, 0, 2, 2}, L"发布 AND 归档"},
+        {{2, 2, 4, 4}, L"版本 100%"},
+        {{5, 5, 6, 6}, L"outside"},
+    });
+
+    Microsoft::WRL::ComPtr<ICondition> condition;
+    Expect(SUCCEEDED(tagsearch::CreateTagSearchCondition(tags, condition.GetAddressOf())),
+           "overlapping tags should create a Shell condition");
+    CONDITION_TYPE type{};
+    Expect(SUCCEEDED(condition->GetConditionType(&type)) && type == CT_AND_CONDITION,
+           "multiple tags must be combined with a Shell AND node");
+
+    Microsoft::WRL::ComPtr<IEnumUnknown> children;
+    Expect(SUCCEEDED(condition->GetSubConditions(IID_PPV_ARGS(children.GetAddressOf()))),
+           "the AND condition should expose its children");
+    tagsearch::Tags actual;
+    for (;;) {
+        Microsoft::WRL::ComPtr<IUnknown> child;
+        ULONG fetched = 0;
+        const auto result = children->Next(1, child.GetAddressOf(), &fetched);
+        if (result == S_FALSE) break;
+        Expect(result == S_OK && fetched == 1, "the child condition should be readable");
+        Microsoft::WRL::ComPtr<ICondition> leaf;
+        Expect(SUCCEEDED(child.As(&leaf)), "the child should implement ICondition");
+        actual.push_back(ExactKeyword(*leaf.Get()));
+    }
+    auto expected = tags;
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    ExpectEqual(actual, expected, "the AND node should hold each tag as a literal keyword");
+}
+
+void CreateSearchFolderAcceptsCombinedTags() {
+    TestDirectory test;
+    PIDLIST_ABSOLUTE id = nullptr;
+    const auto result = tagsearch::CreateTagSearchFolder({L"A", L"B"}, {test.path}, &id);
+    const bool created = SUCCEEDED(result) && id != nullptr;
+    CoTaskMemFree(id);
+    Expect(created, "the Windows Shell should create a search folder with multiple tag conditions");
 }
 
 struct ComApartment {
@@ -187,6 +290,11 @@ int main(int argc, char** argv) {
         {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
+        {"overlap_finds_all_direct_intersections", OverlapFindsAllDirectIntersections},
+        {"overlap_ignores_touching_edges_and_corners", OverlapIgnoresTouchingEdgesAndCorners},
+        {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
+        {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
+        {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
     };
 
     if (argc != 2) {

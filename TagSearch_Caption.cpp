@@ -157,7 +157,23 @@ bool PastDragThreshold(HWND window, const FloatingTag& tag, POINT point) {
 void ActivateTag(HWND window, const FloatingTag& tag) {
     if (tag.isRefresh) {
         PostMessageW(tag.panel.window, kRefresh, 0, 0);
-    } else if (!tagsearch::OpenTagSearch(window, tag.text, tag.panel.folders)) {
+        return;
+    }
+
+    // Use current screen coordinates so dragging a tag changes the next search.
+    RECT selected{};
+    std::vector<tagsearch::TagWindowBounds> visibleWindows;
+    if (GetWindowRect(window, &selected)) {
+        for (const auto& other : tag.panel.tags) {
+            RECT bounds{};
+            if (other->window != window && IsWindowVisible(other->window) &&
+                GetWindowRect(other->window, &bounds)) {
+                visibleWindows.push_back({bounds, other->text});
+            }
+        }
+    }
+    const auto tags = tagsearch::TagsForOverlappingWindows({selected, tag.text}, visibleWindows);
+    if (!tagsearch::OpenTagSearch(window, tags, tag.panel.folders)) {
         MessageBoxW(window, L"无法在文件资源管理器中打开标签搜索。", L"TagSearch", MB_OK | MB_ICONWARNING);
     }
 }

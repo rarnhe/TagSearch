@@ -18,6 +18,11 @@ set(cases
     scan_tags_reads_nested_shell_properties_without_using_cache
     create_search_folder_accepts_multiple_scopes_and_literal_tag
     create_search_folder_rejects_empty_scope
+    overlap_finds_all_direct_intersections
+    overlap_ignores_touching_edges_and_corners
+    search_condition_keeps_one_tag_literal
+    search_condition_combines_all_tags_with_and
+    create_search_folder_accepts_combined_tags
 )
 
 foreach(case IN LISTS cases)

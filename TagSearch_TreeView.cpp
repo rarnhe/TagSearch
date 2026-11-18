@@ -1,5 +1,3 @@
-#include "TagSearch_TreeView.h"
-
 #include "TagSearchCore.h"
 
 #include <commctrl.h>
@@ -125,7 +123,7 @@ void SearchItem(HWND window, const WindowState& state, HTREEITEM item) {
     value.mask = TVIF_PARAM;
     value.hItem = item;
     if (TreeView_GetItem(state.tree, &value) &&
-        !OpenTagSearch(window, state.tags[static_cast<std::size_t>(value.lParam)], state.folders)) {
+        !OpenTagSearch(window, {state.tags[static_cast<std::size_t>(value.lParam)]}, state.folders)) {
         MessageBoxW(window, L"无法在文件资源管理器中打开标签搜索。", L"TagSearch", MB_OK | MB_ICONWARNING);
     }
 }

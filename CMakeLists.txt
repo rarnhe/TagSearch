@@ -8,7 +8,7 @@ target_compile_features(TagSearchCore PUBLIC cxx_std_20)
 target_compile_definitions(TagSearchCore PUBLIC UNICODE _UNICODE NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_link_libraries(TagSearchCore PUBLIC shell32 ole32 propsys uuid structuredquery)
 
-add_executable(TagSearch_TreeView WIN32 TagSearch_TreeView.cpp TagSearch_TreeView.h)
+add_executable(TagSearch_TreeView WIN32 TagSearch_TreeView.cpp)
 target_link_libraries(TagSearch_TreeView PRIVATE TagSearchCore comctl32 shlwapi)
 
 add_executable(TagSearch_Caption WIN32 TagSearch_Caption.cpp)
