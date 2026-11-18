@@ -1,9 +1,9 @@
 # TagSearch C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-18 08:33:47
-- 测试源码基准提交：3e2fd4ee429eeca0343f29c68c80e86541e2f56c
-- 执行记录：https://github.com/rarnhe/TagSearch/actions/runs/44267967406
+- 时间（UTC）：2026-11-18 08:59:08
+- 测试源码基准提交：43cc4dd383b2ca85af76d1b74cc09baaa79ee29c
+- 执行记录：https://github.com/rarnhe/TagSearch/actions/runs/44271574636
 - 平台：Windows / MSVC / C++20 / Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
 - 统计：通过 15 / 失败 0 / 跳过 0 / 共 15
