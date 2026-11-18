@@ -12,6 +12,9 @@
 
 #include <algorithm>
 #include <locale>
+#include <utility>
+
+#include "TagSearch.h"
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -240,35 +243,28 @@ static void ReadTagsFromIniFile(const std::wstring& filePath, std::vector<std::w
 
     // 逐行读取文件
     while (std::getline(iniFile, line)) {
-        // 将 ANSI 字符串转换为 std::wstring
-        int size_needed = MultiByteToWideChar(CP_ACP, 0, line.c_str(), static_cast<int>(line.size()), NULL, 0);
-        std::wstring wline(size_needed, 0);
-        MultiByteToWideChar(CP_ACP, 0, line.c_str(), static_cast<int>(line.size()), &wline[0], size_needed);
+        if (line.empty()) {
+            continue;
+        }
 
-        // 查找 "Prop5=31,"
-        size_t pos = wline.find(L"Prop5=31,");
-        if (pos != std::wstring::npos) {
-            // 提取 "Prop5=31," 之后的内容
-            std::wstring values = wline.substr(pos + 9); // 跳过 "Prop5=31,"
-            std::wstringstream ss(values);
-            std::wstring temp;
+        // 将 ANSI 字符串转换为 std::wstring，并检查转换失败的情况。
+        const int sizeNeeded = MultiByteToWideChar(
+            CP_ACP, 0, line.c_str(), static_cast<int>(line.size()), nullptr, 0);
+        if (sizeNeeded <= 0) {
+            continue;
+        }
 
-            // 以 ";" 分隔读取值
-            while (std::getline(ss, temp, L';')) {
-                if (!temp.empty()) {
-                    tags.push_back(temp); // 存储 wstring
-                }
-            }
+        std::wstring wline(static_cast<std::size_t>(sizeNeeded), L'\0');
+        if (MultiByteToWideChar(
+                CP_ACP, 0, line.c_str(), static_cast<int>(line.size()),
+                wline.data(), sizeNeeded) <= 0) {
+            continue;
+        }
 
-            // 检查并清理最后一个标签
-            if (!tags.empty()) {
-                std::wstring lastTag = tags.back(); // 获取最后一个标签
-                // 这里假设 CleanInvisibleChars 是一个已定义的函数
-                // std::wstring cleanedTag = CleanInvisibleChars(lastTag); // 清理不可见字符
-                // tags.back() = cleanedTag; // 替换原来的最后一个标签
-            }
-
-            break; // 找到后可退出循环
+        auto parsedTags = tagsearch::ParseDesktopIniTagsLine(wline);
+        if (parsedTags.has_value()) {
+            tags.insert(tags.end(), parsedTags->begin(), parsedTags->end());
+            break;
         }
     }
 
@@ -417,22 +413,8 @@ static std::vector<std::wstring> UpdateTags(std::vector<std::wstring> paths) {
                         //    //item = item + 1;
                         //}
                         if (!tagStr.empty()) {
-                            // 使用 std::wistringstream 来分割字符串
-                            std::wistringstream wss(tagStr);
-                            std::wstring tag;
-                            while (std::getline(wss, tag, L';')) {
-                                // 去掉前后空格
-                                tag.erase(0, tag.find_first_not_of(L' ')); // 前空格
-                                tag.erase(tag.find_last_not_of(L' ') + 1); // 后空格
-
-                                //// 检查 allTags 中是否已经存在这个标签
-                                //if (std::find(allTags.begin(), allTags.end(), tag) == allTags.end()) {
-                                //    allTags.push_back(tag); // 仅在不存在时才添加
-                                //}
-
-                                // 将每个子项加入 allTags 向量
-                                allTags.push_back(tag);
-                            }
+                            auto fileTags = tagsearch::SplitKeywords(tagStr);
+                            allTags.insert(allTags.end(), fileTags.begin(), fileTags.end());
                         }
                     }
                 }
@@ -447,17 +429,7 @@ static std::vector<std::wstring> UpdateTags(std::vector<std::wstring> paths) {
         ReadTagsFromIniFile(folderDesktopini, allTags);
     }
 
-    // 使用 std::set 去掉重复项
-    std::set<std::wstring> distinctTags(allTags.begin(), allTags.end());
-    allTags.assign(distinctTags.begin(), distinctTags.end()); // 更新 tags
-
-    // 使用 lambda 表达式进行排序
-    std::sort(allTags.begin(), allTags.end(), [](const std::wstring& a, const std::wstring& b) {
-        std::locale loc("");
-        return std::use_facet<std::collate<wchar_t>>(loc).compare(a.c_str(), a.c_str() + a.size(), b.c_str(), b.c_str() + b.size()) < 0;
-        });
-
-    return allTags; // 返回标签列表
+    return tagsearch::NormalizeTags(std::move(allTags));
 }
 
 static std::vector<std::wstring> SaveDesktopIni(std::vector<std::wstring> paths, HWND hTreeView) {
@@ -518,6 +490,11 @@ static std::vector<std::wstring> SaveDesktopIni(std::vector<std::wstring> paths,
         hItem = TreeView_GetNextItem(hTreeView, hItem, TVGN_NEXT); // 正确的调用方式
     }
 
+    const std::vector<std::wstring> selectedTags =
+        tagsearch::SplitKeywords(accumulatedText);
+    const std::wstring tagsLine =
+        tagsearch::FormatDesktopIniTagsLine(selectedTags);
+
     if (!std::filesystem::exists(folderDesktopini)) { //如果文件不存在
         std::wofstream iniFile(folderDesktopini, std::ios::app);
         if (iniFile.is_open()) {
@@ -525,8 +502,8 @@ static std::vector<std::wstring> SaveDesktopIni(std::vector<std::wstring> paths,
             iniFile << L"[.ShellClassInfo]" << std::endl;
             iniFile << L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}" << std::endl;
 
-            // 将 accumulatedText 写入 ini 文件
-            iniFile << L"Prop5=31," << accumulatedText << std::endl;
+            // 写入格式化后的标签属性行
+            iniFile << tagsLine << std::endl;
             iniFile.close();
         }
         //ShowWin11NativeNotification(folderDesktopini.c_str(), L"is saving");
@@ -541,24 +518,20 @@ static std::vector<std::wstring> SaveDesktopIni(std::vector<std::wstring> paths,
             SetFileAttributesW(folderDesktopini.c_str(), attributes);
         }
 
-        // 如果文件存在，读取其内容更新
+        // 读取已有 desktop.ini，再由可单元测试的核心函数更新标签行。
         std::wifstream iniFile(folderDesktopini);
         std::wstring line;
-        std::wstring updatedContent;
+        std::wstring existingContent;
 
         while (std::getline(iniFile, line)) {
-            if (line.find(L"Prop5=31,") == 0) { // 改为 0，检查行开始位置
-                // 替换 Prop5=31 行
-                updatedContent += L"Prop5=31," + accumulatedText + L"\n"; // 使用新的累积文本
-            }
-            else {
-                updatedContent += line + L"\n"; // 保留原有行
-            }
+            existingContent += line + L"\n";
         }
         iniFile.close();
 
-        //这里还没有调通
-        // 使用 std::wofstream 打开文件，添加 std::ios::trunc 来清空文件内容
+        const std::wstring updatedContent =
+            tagsearch::UpdateDesktopIniTagsLine(existingContent, selectedTags);
+
+        // 覆盖写回更新后的 desktop.ini，保留其他 Shell 配置项。
         std::wofstream outFile(folderDesktopini, std::ios::out | std::ios::trunc);
         outFile.imbue(std::locale("zh-CN")); // 设置区域
         if (outFile.is_open()) {

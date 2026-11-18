@@ -1,24 +1,32 @@
-﻿# CMakeList.txt: TagSearch_TreeView 的 CMake 项目，在此处包括源代码并定义
-# 项目特定的逻辑。
-#
-cmake_minimum_required (VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 
-# 如果支持，请为 MSVC 编译器启用热重载。
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+project(TagSearch LANGUAGES CXX)
+
+add_executable(TagSearch WIN32
+    TagSearch.cpp
+    TagSearch.h
+    TagSearchCore.cpp
+    TagSearchCore.h
+)
+
+target_compile_features(TagSearch PRIVATE cxx_std_20)
+target_compile_definitions(TagSearch PRIVATE UNICODE _UNICODE)
+target_link_libraries(TagSearch PRIVATE
+    comctl32
+    propsys
+    shlwapi
+    shell32
+    ole32
+    oleaut32
+    uuid
+    windowsapp
+)
+
+if(MSVC)
+    target_compile_options(TagSearch PRIVATE /utf-8)
 endif()
 
-project ("TagSearch_TreeView")
-
-# 在项目定义之后添加
-add_definitions(-DUNICODE -D_UNICODE)
-
-# 将源代码添加到此项目的可执行文件。
-add_executable (TagSearch_TreeView WIN32 "TagSearch_TreeView.cpp" "TagSearch_TreeView.h")
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET TagSearch_TreeView PROPERTY CXX_STANDARD 20)
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()
-
-# TODO: 如有需要，请添加测试并安装目标。
