@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(TagSearch LANGUAGES CXX)
 
-add_library(TagSearchCore STATIC TagSearchCore.cpp TagSearchCore.h)
+add_library(TagSearchCore STATIC TagSearch_Core.cpp TagSearch_Core.h)
 target_include_directories(TagSearchCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(TagSearchCore PUBLIC cxx_std_20)
 target_compile_definitions(TagSearchCore PUBLIC UNICODE _UNICODE NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)

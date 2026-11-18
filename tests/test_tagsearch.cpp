@@ -1,4 +1,4 @@
-#include "TagSearchCore.h"
+#include "TagSearch_Core.h"
 
 #include <propvarutil.h>
 #include <shlobj.h>
