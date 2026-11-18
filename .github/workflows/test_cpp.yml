@@ -38,6 +38,8 @@ jobs:
 
       - name: Build application and tests
         id: build
+        env:
+          _CL_: /analyze /we28251
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           cmake --build out/test --config Release --parallel 2>&1 | Tee-Object out/test-logs/build.log
@@ -125,3 +127,55 @@ jobs:
             git push origin HEAD:main
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } elseif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  presets:
+    name: CMake presets (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            host: x64
+            runner: windows-latest
+            machine: "14C"
+          - arch: x64
+            host: x64
+            runner: windows-latest
+            machine: "8664"
+          - arch: arm64
+            host: arm64
+            runner: windows-11-arm
+            machine: "AA64"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and test Debug, Release, RelWithDebInfo and MinSizeRel
+        shell: cmd
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          HOST_ARCH: ${{ matrix.host }}
+          TARGET_MACHINE: ${{ matrix.machine }}
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VS_INSTALL=%%i"
+          if not defined VS_INSTALL exit /b 1
+          call "%VS_INSTALL%\Common7\Tools\VsDevCmd.bat" -arch=%TARGET_ARCH% -host_arch=%HOST_ARCH% || exit /b 1
+          for %%c in (debug release relwithdebinfo minsizerel) do (
+            cmake --preset %TARGET_ARCH%-%%c || exit /b 1
+            cmake --build --preset %TARGET_ARCH%-%%c --parallel || exit /b 1
+            for %%t in (TagSearch_TreeView TagSearch_Caption) do (
+              dumpbin /headers "out\build\%TARGET_ARCH%-%%c\%%t.exe" | findstr /i /c:"%TARGET_MACHINE% machine" || exit /b 1
+            )
+            ctest --preset %TARGET_ARCH%-%%c || exit /b 1
+          )
+
+      - name: Preserve failed preset diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: tagsearch-presets-${{ matrix.arch }}-diagnostics
+          if-no-files-found: ignore
+          path: |
+            out/build/*/Testing/Temporary/
+            out/build/*/CMakeFiles/CMakeConfigureLog.yaml

@@ -1,0 +1,69 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl",
+        "BUILD_TESTING": true
+      }
+    },
+    {"name": "x86", "hidden": true, "inherits": "windows-msvc", "architecture": {"value": "x86", "strategy": "external"}},
+    {"name": "x64", "hidden": true, "inherits": "windows-msvc", "architecture": {"value": "x64", "strategy": "external"}},
+    {"name": "arm64", "hidden": true, "inherits": "windows-msvc", "architecture": {"value": "arm64", "strategy": "external"}},
+    {"name": "x86-debug", "displayName": "x86 Debug", "inherits": "x86", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+    {"name": "x86-release", "displayName": "x86 Release", "inherits": "x86", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+    {"name": "x86-relwithdebinfo", "displayName": "x86 RelWithDebInfo", "inherits": "x86", "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}},
+    {"name": "x86-minsizerel", "displayName": "x86 MinSizeRel", "inherits": "x86", "cacheVariables": {"CMAKE_BUILD_TYPE": "MinSizeRel"}},
+    {"name": "x64-debug", "displayName": "x64 Debug", "inherits": "x64", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+    {"name": "x64-release", "displayName": "x64 Release", "inherits": "x64", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+    {"name": "x64-relwithdebinfo", "displayName": "x64 RelWithDebInfo", "inherits": "x64", "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}},
+    {"name": "x64-minsizerel", "displayName": "x64 MinSizeRel", "inherits": "x64", "cacheVariables": {"CMAKE_BUILD_TYPE": "MinSizeRel"}},
+    {"name": "arm64-debug", "displayName": "arm64 Debug", "inherits": "arm64", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+    {"name": "arm64-release", "displayName": "arm64 Release", "inherits": "arm64", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+    {"name": "arm64-relwithdebinfo", "displayName": "arm64 RelWithDebInfo", "inherits": "arm64", "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}},
+    {"name": "arm64-minsizerel", "displayName": "arm64 MinSizeRel", "inherits": "arm64", "cacheVariables": {"CMAKE_BUILD_TYPE": "MinSizeRel"}}
+  ],
+  "buildPresets": [
+    {"name": "x86-debug", "configurePreset": "x86-debug"},
+    {"name": "x86-release", "configurePreset": "x86-release"},
+    {"name": "x86-relwithdebinfo", "configurePreset": "x86-relwithdebinfo"},
+    {"name": "x86-minsizerel", "configurePreset": "x86-minsizerel"},
+    {"name": "x64-debug", "configurePreset": "x64-debug"},
+    {"name": "x64-release", "configurePreset": "x64-release"},
+    {"name": "x64-relwithdebinfo", "configurePreset": "x64-relwithdebinfo"},
+    {"name": "x64-minsizerel", "configurePreset": "x64-minsizerel"},
+    {"name": "arm64-debug", "configurePreset": "arm64-debug"},
+    {"name": "arm64-release", "configurePreset": "arm64-release"},
+    {"name": "arm64-relwithdebinfo", "configurePreset": "arm64-relwithdebinfo"},
+    {"name": "arm64-minsizerel", "configurePreset": "arm64-minsizerel"}
+  ],
+  "testPresets": [
+    {
+      "name": "windows-tests",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {"name": "x86-debug", "inherits": "windows-tests", "configurePreset": "x86-debug"},
+    {"name": "x86-release", "inherits": "windows-tests", "configurePreset": "x86-release"},
+    {"name": "x86-relwithdebinfo", "inherits": "windows-tests", "configurePreset": "x86-relwithdebinfo"},
+    {"name": "x86-minsizerel", "inherits": "windows-tests", "configurePreset": "x86-minsizerel"},
+    {"name": "x64-debug", "inherits": "windows-tests", "configurePreset": "x64-debug"},
+    {"name": "x64-release", "inherits": "windows-tests", "configurePreset": "x64-release"},
+    {"name": "x64-relwithdebinfo", "inherits": "windows-tests", "configurePreset": "x64-relwithdebinfo"},
+    {"name": "x64-minsizerel", "inherits": "windows-tests", "configurePreset": "x64-minsizerel"},
+    {"name": "arm64-debug", "inherits": "windows-tests", "configurePreset": "arm64-debug"},
+    {"name": "arm64-release", "inherits": "windows-tests", "configurePreset": "arm64-release"},
+    {"name": "arm64-relwithdebinfo", "inherits": "windows-tests", "configurePreset": "arm64-relwithdebinfo"},
+    {"name": "arm64-minsizerel", "inherits": "windows-tests", "configurePreset": "arm64-minsizerel"}
+  ]
+}

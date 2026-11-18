@@ -1,4 +1,5 @@
 #include "TagSearch_Core.h"
+#include "TagSearch_EntryPoint.h"
 
 #include <commctrl.h>
 #include <propkey.h>
@@ -10,21 +11,44 @@
 
 #include <algorithm>
 #include <array>
+#include <future>
+#include <memory>
+#include <system_error>
+#include <thread>
+#include <utility>
 
 namespace tagsearch::treeview {
 namespace {
 
 using Microsoft::WRL::ComPtr;
 constexpr wchar_t kWindowClass[] = L"TagSearchTreeView";
+constexpr wchar_t kMutexName[] = L"Local\\TagSearch.TreeView.391B8D68-6A89-4B0A-8C47-DFFA52EB7FA3";
+constexpr wchar_t kDefaultTitle[] = L"默认目录";
+constexpr wchar_t kScanningSuffix[] = L" — 正在读取标签…";
+constexpr wchar_t kScanFailedSuffix[] = L" — 无法读取标签";
+constexpr UINT kActivate = WM_APP + 1;
+constexpr UINT kScanComplete = WM_APP + 2;
+constexpr UINT kFoldersResolved = WM_APP + 3;
 constexpr wchar_t kAppId[] = L"MyCustom.HookTool.X";
 constexpr int kOpenTag = 1;
 constexpr int kHideTag = 2;
+
+struct StartupScan {
+    Folders folders;
+    Tags tags;
+    bool succeeded = false;
+};
 
 struct WindowState {
     Folders folders;
     Tags tags;
     HWND tree = nullptr;
     HFONT font = nullptr;
+    RECT dock{};
+    std::wstring title = kDefaultTitle;
+    std::future<std::wstring> folderTitle;
+    StartupScan startupScan;
+    std::jthread scanner;
 
     ~WindowState() {
         if (font) {
@@ -128,6 +152,96 @@ void SearchItem(HWND window, const WindowState& state, HTREEITEM item) {
     }
 }
 
+void PopulateTree(WindowState& state) {
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = TVI_ROOT;
+    // Inserting in reverse at the front avoids repeatedly walking the sibling list.
+    insert.hInsertAfter = TVI_FIRST;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+    SendMessageW(state.tree, WM_SETREDRAW, FALSE, 0);
+    for (std::size_t count = state.tags.size(); count > 0; --count) {
+        const std::size_t i = count - 1;
+        insert.item.pszText = state.tags[i].data();
+        insert.item.lParam = static_cast<LPARAM>(i);
+        TreeView_InsertItem(state.tree, &insert);
+    }
+    SendMessageW(state.tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(state.tree, nullptr, TRUE);
+}
+
+RECT DockBounds(UINT dpi) {
+    const POINT origin{};
+    MONITORINFO monitor{sizeof(monitor)};
+    if (!GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor)) {
+        return {};
+    }
+
+    const auto& work = monitor.rcWork;
+    const int width = std::min(MulDiv(350, dpi, USER_DEFAULT_SCREEN_DPI),
+                               static_cast<int>(work.right - work.left));
+    return {work.right - width, work.top, work.right, work.bottom};
+}
+
+void UpdateDock(HWND window, WindowState& state, UINT dpi) {
+    const auto dock = DockBounds(dpi);
+    if (IsRectEmpty(&dock)) return;
+
+    state.dock = dock;
+    if (!IsIconic(window)) {
+        SetWindowPos(window, nullptr, dock.left, dock.top, dock.right - dock.left,
+                     dock.bottom - dock.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+void ActivateWindow(HWND window, WindowState& state) {
+    if (IsIconic(window)) {
+        ShowWindow(window, SW_RESTORE);
+        UpdateDock(window, state, GetDpiForWindow(window));
+    }
+    SetWindowPos(window, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (SetForegroundWindow(window)) SetFocus(state.tree);
+}
+
+std::wstring FolderTitle(const Folders& folders, std::size_t defaultCount) {
+    std::wstring title;
+    for (std::size_t i = defaultCount; i < folders.size(); ++i) {
+        const auto& folder = folders[i];
+        const auto name = folder.filename();
+        if (!title.empty()) title += L'·';
+        title += name.empty() ? folder.native() : name.native();
+    }
+    if (title.empty()) return kDefaultTitle;
+    return title;
+}
+
+void UpdateTitle(HWND window, const WindowState& state, std::wstring_view suffix = {}) {
+    auto text = state.title;
+    text.append(suffix);
+    SetWindowTextW(window, text.c_str());
+}
+
+void ScanOnStartup(HWND window, StartupScan& scan, std::promise<std::wstring>& title,
+                   std::stop_token stop) {
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        try {
+            std::size_t defaultCount = 0;
+            scan.folders = ResolveSearchFolders(GetCommandLineW(), &defaultCount);
+            if (!stop.stop_requested()) {
+                title.set_value(FolderTitle(scan.folders, defaultCount));
+                PostMessageW(window, kFoldersResolved, 0, 0);
+                scan.tags = ScanTags(scan.folders, stop);
+                scan.succeeded = !stop.stop_requested();
+                if (scan.succeeded) RegisterAppShortcut();
+            }
+        } catch (...) {
+            scan.succeeded = false;
+        }
+        CoUninitialize();
+    }
+    if (!stop.stop_requested()) PostMessageW(window, kScanComplete, 0, 0);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_NCCREATE) {
         const auto create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
@@ -147,31 +261,62 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         UpdateFont(window, *state);
         LayoutTree(window, *state);
 
-        TVINSERTSTRUCTW insert{};
-        insert.hParent = TVI_ROOT;
-        // Inserting in reverse at the front avoids repeatedly walking the sibling list.
-        insert.hInsertAfter = TVI_FIRST;
-        insert.item.mask = TVIF_TEXT | TVIF_PARAM;
-        for (std::size_t count = state->tags.size(); count > 0; --count) {
-            const std::size_t i = count - 1;
-            insert.item.pszText = state->tags[i].data();
-            insert.item.lParam = static_cast<LPARAM>(i);
-            TreeView_InsertItem(state->tree, &insert);
+        return 0;
+    }
+    case kFoldersResolved:
+        if (state->folderTitle.valid()) {
+            state->title = state->folderTitle.get();
+            UpdateTitle(window, *state, kScanningSuffix);
         }
         return 0;
+    case kScanComplete:
+        if (state->scanner.joinable()) {
+            state->scanner.join();
+            if (state->startupScan.succeeded) {
+                state->folders = std::move(state->startupScan.folders);
+                state->tags = std::move(state->startupScan.tags);
+                PopulateTree(*state);
+                UpdateTitle(window, *state);
+            } else {
+                UpdateTitle(window, *state, kScanFailedSuffix);
+            }
+        }
+        return 0;
+    case kActivate:
+        ActivateWindow(window, *state);
+        return 0;
+    case WM_MOUSEACTIVATE:
+        // Keep normal click-to-focus, including keyboard navigation after a click.
+        return HIWORD(lParam) == WM_MOUSEMOVE ? MA_NOACTIVATE : MA_ACTIVATE;
+    case WM_NCHITTEST: {
+        const auto hit = DefWindowProcW(window, message, wParam, lParam);
+        return hit == HTCAPTION ? HTCLIENT : hit;
+    }
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_MOVE) return 0;
+        break;
+    case WM_WINDOWPOSCHANGING: {
+        auto& position = *reinterpret_cast<WINDOWPOS*>(lParam);
+        if ((position.flags & SWP_NOMOVE) == 0 && !IsIconic(window)) {
+            position.x = state->dock.left;
+            position.y = state->dock.top;
+        }
+        break;
     }
     case WM_SIZE:
         LayoutTree(window, *state);
         return 0;
-    case WM_DPICHANGED: {
-        const auto& position = *reinterpret_cast<const RECT*>(lParam);
-        SetWindowPos(window, nullptr, position.left, position.top,
-                     position.right - position.left, position.bottom - position.top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+    case WM_DPICHANGED:
+        UpdateDock(window, *state, HIWORD(wParam));
         UpdateFont(window, *state);
         LayoutTree(window, *state);
         return 0;
-    }
+    case WM_DISPLAYCHANGE:
+        UpdateDock(window, *state, GetDpiForWindow(window));
+        break;
+    case WM_SETTINGCHANGE:
+        if (wParam == SPI_SETWORKAREA) UpdateDock(window, *state, GetDpiForWindow(window));
+        break;
     case WM_NOTIFY: {
         const auto* notice = reinterpret_cast<const NMHDR*>(lParam);
         if (notice->hwndFrom != state->tree) break;
@@ -209,23 +354,19 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     }
     case WM_DESTROY:
+        state->scanner.request_stop();
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-} // namespace
-
 int Run(HINSTANCE instance, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_TREEVIEW_CLASSES};
     if (!InitCommonControlsEx(&controls)) return 1;
 
-    RegisterAppShortcut();
     WindowState state;
-    state.folders = ResolveSearchFolders(GetCommandLineW());
-    state.tags = ScanTags(state.folders);
 
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
@@ -235,33 +376,86 @@ int Run(HINSTANCE instance, int showCommand) {
     windowClass.lpszClassName = kWindowClass;
     if (!RegisterClassW(&windowClass)) return 1;
 
-    POINT origin{};
-    MONITORINFO monitor{sizeof(monitor)};
-    if (!GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor)) return 1;
-    const auto& work = monitor.rcWork;
-    const int width = std::min(MulDiv(350, GetDpiForSystem(), USER_DEFAULT_SCREEN_DPI),
-                               static_cast<int>(work.right - work.left));
-    const HWND window = CreateWindowExW(0, kWindowClass, L"TagSearch · TreeView",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        work.right - width, work.top, width, work.bottom - work.top,
-        nullptr, nullptr, instance, &state);
-    if (!window) return 1;
+    state.dock = DockBounds(GetDpiForSystem());
+    if (IsRectEmpty(&state.dock)) return 1;
+    const auto& dock = state.dock;
+    // Keep the owner hidden and create the panel as its owned popup.
+    constexpr DWORD toolStyles = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    const HWND owner = CreateWindowExW(toolStyles, L"STATIC", nullptr, WS_POPUP,
+        0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+    if (!owner) return 1;
+
+    const std::wstring startingTitle = state.title + kScanningSuffix;
+    const HWND window = CreateWindowExW(toolStyles, kWindowClass, startingTitle.c_str(),
+        WS_POPUP | WS_CAPTION | WS_MINIMIZEBOX,
+        dock.left, dock.top, dock.right - dock.left, dock.bottom - dock.top,
+        owner, nullptr, instance, &state);
+    if (!window) {
+        DestroyWindow(owner);
+        return 1;
+    }
 
     ShowWindow(window, showCommand);
+    ActivateWindow(window, state);
+    try {
+        std::promise<std::wstring> folderTitle;
+        state.folderTitle = folderTitle.get_future();
+        state.scanner = std::jthread(
+            [window, &state, title = std::move(folderTitle)](std::stop_token stop) mutable {
+                ScanOnStartup(window, state.startupScan, title, stop);
+            });
+    } catch (const std::system_error&) {
+        UpdateTitle(window, state, kScanFailedSuffix);
+    }
+
     MSG message{};
     BOOL result;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    DestroyWindow(owner);
     return result < 0 ? 1 : static_cast<int>(message.wParam);
 }
 
+int RunSingleInstance(HINSTANCE instance, int showCommand) {
+    HANDLE rawMutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    const DWORD mutexStatus = GetLastError();
+    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(rawMutex, &CloseHandle);
+    if (!mutex) return 1;
+
+    if (mutexStatus == ERROR_ALREADY_EXISTS) {
+        const ULONGLONG deadline = GetTickCount64() + 5000;
+        for (;;) {
+            const DWORD wait = WaitForSingleObject(mutex.get(), 0);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) break;
+            if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) return 1;
+
+            if (const HWND existing = FindWindowW(kWindowClass, nullptr)) {
+                DWORD processId = 0;
+                if (GetWindowThreadProcessId(existing, &processId)) {
+                    // A shell-launched copy can transfer its foreground privilege to the owner.
+                    AllowSetForegroundWindow(processId);
+                    if (PostMessageW(existing, kActivate, 0, 0)) return 0;
+                }
+            }
+            Sleep(25);
+        }
+    }
+
+    int result = 1;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        result = Run(instance, showCommand);
+        CoUninitialize();
+    }
+    ReleaseMutex(mutex.get());
+    return result;
+}
+
+} // namespace
 } // namespace tagsearch::treeview
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
-    const int result = tagsearch::treeview::Run(instance, showCommand);
-    CoUninitialize();
-    return result;
+_Use_decl_annotations_
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
+    return tagsearch::treeview::RunSingleInstance(instance, showCommand);
 }
