@@ -143,10 +143,11 @@ std::vector<std::wstring> NormalizeTags(std::vector<std::wstring> tags) {
     return normalized;
 }
 
-Folders ResolveSearchFolders(const wchar_t* commandLine) {
+Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount) {
     Folders folders;
     AddKnownFolder(folders, FOLDERID_Desktop);
     AddKnownFolder(folders, FOLDERID_Downloads);
+    if (defaultCount) *defaultCount = folders.size();
 
     int count = 0;
     const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(

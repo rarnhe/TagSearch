@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <shtypes.h>
 
+#include <cstddef>
 #include <filesystem>
 #include <stop_token>
 #include <string>
@@ -28,7 +29,7 @@ Tags TagsForOverlappingWindows(
     const TagWindowBounds& selected, const std::vector<TagWindowBounds>& visibleWindows);
 
 // Pass a complete Unicode command line, including argv[0].
-Folders ResolveSearchFolders(const wchar_t* commandLine);
+Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount = nullptr);
 
 // Call Shell operations from a thread with COM initialized.
 Tags ScanTags(const Folders& folders, std::stop_token stop = {});

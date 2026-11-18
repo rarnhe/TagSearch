@@ -36,5 +36,8 @@ target_compile_options(tagsearch_treeview_startup_test PRIVATE /utf-8)
 add_dependencies(tagsearch_treeview_startup_test TagSearch_TreeView)
 
 add_test(NAME treeview_single_instance_startup
-         COMMAND tagsearch_treeview_startup_test $<TARGET_FILE:TagSearch_TreeView>)
-set_tests_properties(treeview_single_instance_startup PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
+         COMMAND tagsearch_treeview_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
+add_test(NAME treeview_fixed_window_and_folder_title
+         COMMAND tagsearch_treeview_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
+                     PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
