@@ -1,4 +1,5 @@
 #include "TagSearch_Core.h"
+#include "TagSearch_EntryPoint.h"
 
 #include <dwmapi.h>
 
@@ -247,7 +248,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
-            if ((lParam & (1L << 30)) == 0) ActivateTag(window, *tag);
+            if ((HIWORD(lParam) & KF_REPEAT) == 0) ActivateTag(window, *tag);
             return 0;
         }
         break;
@@ -294,7 +295,8 @@ void LayoutTags(Panel& panel) {
     const int rows = std::max(1, (static_cast<int>(work.bottom) - top) / (cellHeight + gap));
     const int columns = std::max(1, int(work.right - work.left - gap) / (cellWidth + gap));
     // Reserve the first slot for refresh. Leave at least one additional slot on small displays.
-    const std::size_t capacity = static_cast<std::size_t>(std::max(1, rows * columns - 1));
+    const auto slots = static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
+    const std::size_t capacity = std::max<std::size_t>(1, slots - 1);
     const std::size_t pages = std::max<std::size_t>(1, (panel.tags.size() + capacity - 1) / capacity);
     panel.page = std::min(panel.page, pages - 1);
     const std::size_t first = panel.page * capacity;
@@ -478,7 +480,8 @@ int Run(HINSTANCE instance, int showCommand) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+_Use_decl_annotations_
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     const int result = Run(instance, showCommand);
     CoUninitialize();

@@ -1,4 +1,5 @@
 #include "TagSearch_Core.h"
+#include "TagSearch_EntryPoint.h"
 
 #include <commctrl.h>
 #include <propkey.h>
@@ -215,8 +216,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-} // namespace
-
 int Run(HINSTANCE instance, int showCommand) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_TREEVIEW_CLASSES};
@@ -241,8 +240,8 @@ int Run(HINSTANCE instance, int showCommand) {
     const auto& work = monitor.rcWork;
     const int width = std::min(MulDiv(350, GetDpiForSystem(), USER_DEFAULT_SCREEN_DPI),
                                static_cast<int>(work.right - work.left));
-    const HWND window = CreateWindowExW(0, kWindowClass, L"TagSearch · TreeView",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+    const HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"TagSearch · TreeView",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
         work.right - width, work.top, width, work.bottom - work.top,
         nullptr, nullptr, instance, &state);
     if (!window) return 1;
@@ -257,9 +256,11 @@ int Run(HINSTANCE instance, int showCommand) {
     return result < 0 ? 1 : static_cast<int>(message.wParam);
 }
 
+} // namespace
 } // namespace tagsearch::treeview
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+_Use_decl_annotations_
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     const int result = tagsearch::treeview::Run(instance, showCommand);
     CoUninitialize();
