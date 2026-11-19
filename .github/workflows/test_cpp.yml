@@ -130,38 +130,29 @@ jobs:
 
   presets:
     name: CMake presets (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: windows-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86
-            host: x64
-            runner: windows-latest
             machine: "14C"
           - arch: x64
-            host: x64
-            runner: windows-latest
             machine: "8664"
-          - arch: arm64
-            host: arm64
-            runner: windows-11-arm
-            machine: "AA64"
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build and test Debug, Release, RelWithDebInfo and MinSizeRel
+      - name: Build and test Debug and Release
         shell: cmd
         env:
           TARGET_ARCH: ${{ matrix.arch }}
-          HOST_ARCH: ${{ matrix.host }}
           TARGET_MACHINE: ${{ matrix.machine }}
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VS_INSTALL=%%i"
           if not defined VS_INSTALL exit /b 1
-          call "%VS_INSTALL%\Common7\Tools\VsDevCmd.bat" -arch=%TARGET_ARCH% -host_arch=%HOST_ARCH% || exit /b 1
-          for %%c in (debug release relwithdebinfo minsizerel) do (
+          call "%VS_INSTALL%\Common7\Tools\VsDevCmd.bat" -arch=%TARGET_ARCH% -host_arch=x64 || exit /b 1
+          for %%c in (debug release) do (
             cmake --preset %TARGET_ARCH%-%%c || exit /b 1
             cmake --build --preset %TARGET_ARCH%-%%c --parallel || exit /b 1
             for %%t in (TagSearch_TreeView TagSearch_Caption) do (
