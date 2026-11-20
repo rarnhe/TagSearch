@@ -28,15 +28,14 @@ TagSearch_Caption.exe C:\Work\repos "D:\Project Files"
 
 ## 构建与测试
 
-需要 Windows 10 或 Windows 11、Visual Studio 2022 或更新版本的 MSVC 工具、Windows SDK 和 CMake。预设使用 Ninja，Visual Studio 可通过「使用 C++ 的桌面开发」安装 CMake 工具，构建 ARM64 还需安装 MSVC ARM64 工具。
+需要 Windows 10 或 Windows 11、Visual Studio 2022 或更新版本的 MSVC 工具、Windows SDK 和 CMake。预设使用 Ninja，Visual Studio 可通过「使用 C++ 的桌面开发」安装 CMake 工具。
 
 用 Visual Studio 的「打开文件夹」打开仓库，然后在顶部配置下拉菜单选择架构和构建模式。
 
 | 目标架构 | 模式 |
 | --- | --- |
-| x86 | Debug、Release、RelWithDebInfo、MinSizeRel |
-| x64 | Debug、Release、RelWithDebInfo、MinSizeRel |
-| ARM64 | Debug、Release、RelWithDebInfo、MinSizeRel |
+| x86 | Debug、Release |
+| x64 | Debug、Release |
 
 在命令行使用预设时，先打开与目标架构对应的 Visual Studio Developer Command Prompt。Ninja 使用终端中选定的工具链。
 
@@ -54,4 +53,4 @@ cmake --build out/test --config Release --parallel
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error
 ```
 
-直接生成工程时，两个 EXE 位于 `out/test/Release/`。Windows CI 验证上述 12 组预设的 EXE 架构并运行 CTest。测试覆盖标签规范化、默认目录、带引号的 Unicode 路径、嵌套 JPEG 的真实标签属性、重新扫描、窗口重叠判断及多标签 AND 搜索对象创建。PR 的 `test_report.md` 与 JUnit 结果可从 Actions 下载，主分支运行后会更新仓库根目录的报告。集成测试会实际启动 TreeView，检查默认启动、隐藏所有者、重复启动恢复、固定位置和目录标题。Alt+Tab、Win+Tab、窗口拖动、跨屏 DPI、主题及 Explorer 实际返回的结果适合在交互式 Windows 桌面验证。
+直接生成工程时，两个 EXE 位于 `out/test/Release/`。Windows CI 验证上述 4 组预设的 EXE 架构并运行 CTest。测试覆盖标签规范化、默认目录、带引号的 Unicode 路径、嵌套 JPEG 的真实标签属性、重新扫描、窗口重叠判断及多标签 AND 搜索对象创建。PR 的 `test_report.md` 与 JUnit 结果可从 Actions 下载，主分支运行后会更新仓库根目录的报告。集成测试会实际启动 TreeView，检查默认启动、隐藏所有者、重复启动恢复、固定位置和目录标题。Alt+Tab、Win+Tab、窗口拖动、跨屏 DPI、主题及 Explorer 实际返回的结果适合在交互式 Windows 桌面验证。

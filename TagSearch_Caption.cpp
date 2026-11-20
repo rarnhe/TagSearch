@@ -7,22 +7,30 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <system_error>
+#include <thread>
+#include <utility>
+#include <windowsx.h>
 
 namespace {
 
-constexpr wchar_t kPanelClass[] = L"TagSearchCaption";
+constexpr wchar_t kControllerClass[] = L"TagSearchCaptionController";
 constexpr wchar_t kTagClass[] = L"TagSearchFloatingTag";
-constexpr UINT kRefresh = WM_APP + 1;
-constexpr UINT kReflow = WM_APP + 2;
-constexpr INT_PTR kPrevious = 1;
-constexpr INT_PTR kNext = 2;
+constexpr wchar_t kMutexName[] = L"Local\\TagSearch.Caption.AEF63BC1-F7FC-4837-B810-4326C404D56E";
+constexpr UINT kActivate = WM_APP + 1;
+constexpr UINT kScanComplete = WM_APP + 2;
+constexpr UINT kReflow = WM_APP + 3;
+constexpr UINT kMenuCommand = WM_APP + 4;
+constexpr UINT kPrevious = 1;
+constexpr UINT kNext = 2;
+constexpr UINT kRefresh = 3;
+constexpr UINT kExit = 4;
 
-struct Panel;
+struct Caption;
 
 struct FloatingTag {
-    Panel& panel;
+    Caption& caption;
     std::wstring text;
-    bool isRefresh;
     HWND window = nullptr;
     bool pressed = false;
     bool dragging = false;
@@ -31,27 +39,26 @@ struct FloatingTag {
     bool positioned = false;
 };
 
-struct Panel {
-    HINSTANCE instance;
+struct ScanResult {
     tagsearch::Folders folders;
-    HWND window = nullptr;
-    HWND status = nullptr;
-    HWND previous = nullptr;
-    HWND next = nullptr;
-    HMONITOR monitor = nullptr;
-    HFONT font = nullptr;
-    std::map<UINT, HFONT> tagFonts;
-    std::unique_ptr<FloatingTag> refresh;
-    std::vector<std::unique_ptr<FloatingTag>> tags;
-    std::size_t discoveredTags = 0;
-    std::size_t page = 0;
+    tagsearch::Tags tags;
+    bool success = false;
+};
 
-    ~Panel() {
-        if (window && IsWindow(window)) DestroyWindow(window);
-        if (font) DeleteObject(font);
-        for (const auto& [dpi, tagFont] : tagFonts) {
-            DeleteObject(tagFont);
-        }
+struct Caption {
+    HINSTANCE instance;
+    HWND controller = nullptr;
+    std::map<UINT, HFONT> tagFonts;
+    std::vector<std::unique_ptr<FloatingTag>> tags;
+    tagsearch::Folders folders;
+    std::size_t page = 0;
+    std::size_t pageCount = 1;
+    ScanResult scan;
+    std::jthread scanner;
+
+    ~Caption() {
+        if (controller) DestroyWindow(controller);
+        for (const auto& entry : tagFonts) DeleteObject(entry.second);
     }
 };
 
@@ -76,8 +83,8 @@ HFONT MakeFont(int pixels, int weight, const wchar_t* family) {
                        DEFAULT_PITCH, family);
 }
 
-HFONT TagFont(Panel& panel, UINT dpi) {
-    if (const auto found = panel.tagFonts.find(dpi); found != panel.tagFonts.end()) {
+HFONT TagFont(Caption& caption, UINT dpi) {
+    if (const auto found = caption.tagFonts.find(dpi); found != caption.tagFonts.end()) {
         return found->second;
     }
     const HFONT font = MakeFont(Scale(22, dpi), FW_BOLD, L"LiSu");
@@ -85,7 +92,7 @@ HFONT TagFont(Panel& panel, UINT dpi) {
         return static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     }
     // The Windows font mapper supplies a fallback when LiSu is unavailable.
-    panel.tagFonts.emplace(dpi, font);
+    caption.tagFonts.emplace(dpi, font);
     return font;
 }
 
@@ -139,7 +146,7 @@ void PaintTag(HWND window, FloatingTag& tag) {
     const auto palette = TagPalette();
     SetDCBrushColor(dc, palette.background);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-    const auto previous = SelectObject(dc, TagFont(tag.panel, WindowDpi(window)));
+    const auto previous = SelectObject(dc, TagFont(tag.caption, WindowDpi(window)));
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, palette.text);
     InflateRect(&client, -Scale(6, WindowDpi(window)), 0);
@@ -156,16 +163,11 @@ bool PastDragThreshold(HWND window, const FloatingTag& tag, POINT point) {
 }
 
 void ActivateTag(HWND window, const FloatingTag& tag) {
-    if (tag.isRefresh) {
-        PostMessageW(tag.panel.window, kRefresh, 0, 0);
-        return;
-    }
-
     // Use current screen coordinates so dragging a tag changes the next search.
     RECT selected{};
     std::vector<tagsearch::TagWindowBounds> visibleWindows;
     if (GetWindowRect(window, &selected)) {
-        for (const auto& other : tag.panel.tags) {
+        for (const auto& other : tag.caption.tags) {
             RECT bounds{};
             if (other->window != window && IsWindowVisible(other->window) &&
                 GetWindowRect(other->window, &bounds)) {
@@ -174,9 +176,37 @@ void ActivateTag(HWND window, const FloatingTag& tag) {
         }
     }
     const auto tags = tagsearch::TagsForOverlappingWindows({selected, tag.text}, visibleWindows);
-    if (!tagsearch::OpenTagSearch(window, tags, tag.panel.folders)) {
+    if (!tagsearch::OpenTagSearch(window, tags, tag.caption.folders)) {
         MessageBoxW(window, L"无法在文件资源管理器中打开标签搜索。", L"TagSearch", MB_OK | MB_ICONWARNING);
     }
+}
+
+void ShowTagMenu(HWND window, const Caption& caption, LPARAM position) {
+    const HWND controller = caption.controller;
+    const bool canGoBack = caption.page > 0;
+    const bool canGoForward = caption.page + 1 < caption.pageCount;
+    const bool scanning = caption.scanner.joinable();
+
+    const HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    if (caption.pageCount > 1) {
+        AppendMenuW(menu, MF_STRING | (canGoBack ? MF_ENABLED : MF_GRAYED), kPrevious, L"上一页");
+        AppendMenuW(menu, MF_STRING | (canGoForward ? MF_ENABLED : MF_GRAYED), kNext, L"下一页");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+    AppendMenuW(menu, MF_STRING | (scanning ? MF_GRAYED : MF_ENABLED), kRefresh, L"刷新标签");
+    AppendMenuW(menu, MF_STRING, kExit, L"退出");
+
+    POINT point{GET_X_LPARAM(position), GET_Y_LPARAM(position)};
+    if (point.x == -1 && point.y == -1) {
+        RECT bounds{};
+        GetWindowRect(window, &bounds);
+        point = {bounds.left, bounds.bottom};
+    }
+    const auto command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                                        point.x, point.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    if (command) PostMessageW(controller, kMenuCommand, command, 0);
 }
 
 LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -252,63 +282,55 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         break;
+    case WM_CONTEXTMENU:
+        ShowTagMenu(window, tag->caption, lParam);
+        return 0;
     case WM_CLOSE:
-        // The panel manages the tag windows for the lifetime of this scan.
+        PostMessageW(tag->caption.controller, WM_CLOSE, 0, 0);
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-std::unique_ptr<FloatingTag> CreateTag(Panel& panel, std::wstring text, bool refresh = false) {
-    auto tag = std::make_unique<FloatingTag>(FloatingTag{panel, std::move(text), refresh});
-    const RECT work = WorkArea(panel.window);
-    tag->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, kTagClass, tag->text.c_str(),
-        WS_POPUP | WS_CAPTION, work.left, work.top, 1, 1, panel.window, nullptr, panel.instance, tag.get());
+std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& text, const RECT& work) {
+    auto tag = std::make_unique<FloatingTag>(FloatingTag{caption, text});
+    tag->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, kTagClass, text.c_str(),
+        WS_POPUP | WS_CAPTION, work.left, work.top, 1, 1, caption.controller, nullptr,
+        caption.instance, tag.get());
     return tag->window ? std::move(tag) : nullptr;
 }
 
-void LayoutPanel(Panel& panel) {
-    const UINT dpi = WindowDpi(panel.window);
-    const HFONT font = MakeFont(Scale(15, dpi), FW_NORMAL, L"Segoe UI");
-    if (font) {
-        for (const HWND child : {panel.status, panel.previous, panel.next}) {
-            SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-        }
-        if (panel.font) DeleteObject(panel.font);
-        panel.font = font;
-    }
-    MoveWindow(panel.status, Scale(12, dpi), Scale(9, dpi), Scale(265, dpi), Scale(23, dpi), TRUE);
-    MoveWindow(panel.previous, Scale(12, dpi), Scale(39, dpi), Scale(78, dpi), Scale(27, dpi), TRUE);
-    MoveWindow(panel.next, Scale(98, dpi), Scale(39, dpi), Scale(78, dpi), Scale(27, dpi), TRUE);
-}
-
-void LayoutTags(Panel& panel) {
-    const UINT dpi = WindowDpi(panel.window);
-    const RECT work = WorkArea(panel.window);
+void LayoutTags(Caption& caption) {
+    const UINT dpi = WindowDpi(caption.controller);
+    const RECT work = WorkArea(caption.controller);
     const int gap = Scale(8, dpi);
     const int cellWidth = std::max(1, std::min(Scale(230, dpi), int(work.right - work.left) - 2 * gap));
-    constexpr DWORD style = WS_POPUP | WS_CAPTION;
     RECT frame{0, 0, cellWidth, Scale(30, dpi)};
-    AdjustWindowRectExForDpi(&frame, style, FALSE, WS_EX_TOOLWINDOW, dpi);
+    AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION, FALSE, WS_EX_TOOLWINDOW, dpi);
     const int cellHeight = frame.bottom - frame.top;
-    const int top = std::min(work.top + Scale(122, dpi), work.bottom - cellHeight - gap);
-    const int rows = std::max(1, (static_cast<int>(work.bottom) - top) / (cellHeight + gap));
+    const int top = work.top + gap;
+    const int rows = std::max(1, int(work.bottom - top) / (cellHeight + gap));
     const int columns = std::max(1, int(work.right - work.left - gap) / (cellWidth + gap));
-    // Reserve the first slot for refresh. Leave at least one additional slot on small displays.
-    const auto slots = static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
-    const std::size_t capacity = std::max<std::size_t>(1, slots - 1);
-    const std::size_t pages = std::max<std::size_t>(1, (panel.tags.size() + capacity - 1) / capacity);
-    panel.page = std::min(panel.page, pages - 1);
-    const std::size_t first = panel.page * capacity;
-    const std::size_t last = std::min(first + capacity, panel.tags.size());
+    const auto capacity = static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
+    caption.pageCount = caption.tags.empty() ? 1 : 1 + (caption.tags.size() - 1) / capacity;
+    caption.page = std::min(caption.page, caption.pageCount - 1);
+    const std::size_t first = caption.page * capacity;
+    const std::size_t last = first + std::min(capacity, caption.tags.size() - first);
 
-    const HDC dc = GetDC(panel.window);
-    const auto oldFont = dc ? SelectObject(dc, TagFont(panel, dpi)) : nullptr;
-    const auto place = [&](FloatingTag& tag, std::size_t slot) {
+    const HDC dc = GetDC(caption.controller);
+    const auto oldFont = dc ? SelectObject(dc, TagFont(caption, dpi)) : nullptr;
+    for (std::size_t i = 0; i < caption.tags.size(); ++i) {
+        auto& tag = *caption.tags[i];
+        if (i < first || i >= last) {
+            ShowWindow(tag.window, SW_HIDE);
+            continue;
+        }
+
         if (!tag.positioned) {
             SIZE text{};
             if (dc) GetTextExtentPoint32W(dc, tag.text.c_str(), static_cast<int>(tag.text.size()), &text);
             const int width = std::min(cellWidth, std::max(Scale(52, dpi), static_cast<int>(text.cx) + Scale(36, dpi)));
+            const auto slot = i - first;
             const int column = static_cast<int>(slot / rows);
             const int row = static_cast<int>(slot % rows);
             const int right = work.right - gap - column * (cellWidth + gap);
@@ -317,87 +339,100 @@ void LayoutTags(Panel& panel) {
             SetWindowPos(tag.window, nullptr, x, y, width, cellHeight, SWP_NOACTIVATE | SWP_NOZORDER);
             tag.positioned = true;
         }
-        if (!IsIconic(panel.window) && IsWindowVisible(panel.window)) ShowWindow(tag.window, SW_SHOWNA);
-    };
-
-    if (panel.refresh) place(*panel.refresh, 0);
-    for (std::size_t i = 0; i < panel.tags.size(); ++i) {
-        if (i >= first && i < last) {
-            place(*panel.tags[i], i - first + (panel.refresh ? 1 : 0));
-        } else {
-            ShowWindow(panel.tags[i]->window, SW_HIDE);
-        }
+        ShowWindow(tag.window, SW_SHOWNA);
     }
     if (dc) {
         SelectObject(dc, oldFont);
-        ReleaseDC(panel.window, dc);
+        ReleaseDC(caption.controller, dc);
     }
-
-    std::wstring status = L"标签 " + std::to_wstring(panel.discoveredTags) +
-        L"    ·    目录 " + std::to_wstring(panel.folders.size());
-    if (pages > 1) status += L"    ·    " + std::to_wstring(panel.page + 1) + L"/" + std::to_wstring(pages);
-    if (panel.discoveredTags != panel.tags.size()) status += L"    ·    部分窗口未创建";
-    SetWindowTextW(panel.status, status.c_str());
-    EnableWindow(panel.previous, panel.page > 0);
-    EnableWindow(panel.next, panel.page + 1 < pages);
 }
 
-void RefreshTags(Panel& panel) {
-    SetWindowTextW(panel.status, L"正在读取标签…");
-    UpdateWindow(panel.window);
-    const auto tags = tagsearch::ScanTags(panel.folders);
-    for (const auto& tag : panel.tags) DestroyWindow(tag->window);
-    panel.tags.clear();
-    panel.discoveredTags = tags.size();
-    panel.page = 0;
-    if (panel.refresh) panel.refresh->positioned = false;
-
-    for (const auto& text : tags) {
-        if (auto tag = CreateTag(panel, text)) {
-            panel.tags.push_back(std::move(tag));
+void ActivateTags(Caption& caption) {
+    LayoutTags(caption);
+    // Preserve the stacking order of overlapping tags when bringing the page forward.
+    std::vector<HWND> windows;
+    for (HWND window = GetTopWindow(nullptr); window; window = GetWindow(window, GW_HWNDNEXT)) {
+        if (GetWindow(window, GW_OWNER) == caption.controller && IsWindowVisible(window)) {
+            windows.push_back(window);
         }
     }
-    LayoutTags(panel);
+    for (auto i = windows.rbegin(); i != windows.rend(); ++i) {
+        if (IsIconic(*i)) ShowWindow(*i, SW_RESTORE);
+        SetWindowPos(*i, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    if (!windows.empty()) SetForegroundWindow(windows.front());
 }
 
-LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+void ScanInBackground(Caption& caption, std::stop_token stop) {
+    auto& scan = caption.scan;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        try {
+            scan.folders = tagsearch::ResolveSearchFolders(GetCommandLineW());
+            scan.tags = tagsearch::ScanTags(scan.folders, stop);
+            scan.success = !stop.stop_requested();
+        } catch (...) {
+            scan.success = false;
+        }
+        CoUninitialize();
+    }
+    // The controller is owned by the UI thread and outlives the scanner.
+    if (!stop.stop_requested()) PostMessageW(caption.controller, kScanComplete, 0, 0);
+}
+
+bool StartScan(Caption& caption) {
+    if (caption.scanner.joinable()) return true;
+    caption.scan = {};
+    try {
+        caption.scanner = std::jthread([&caption](std::stop_token stop) {
+            ScanInBackground(caption, stop);
+        });
+    } catch (const std::system_error&) {
+        return false;
+    }
+    return true;
+}
+
+void ShowScanResult(Caption& caption) {
+    if (!caption.scanner.joinable()) return;
+    caption.scanner.join();
+    if (!caption.scan.success) {
+        if (caption.tags.empty()) PostQuitMessage(1);
+        return;
+    }
+
+    for (const auto& tag : caption.tags) DestroyWindow(tag->window);
+    caption.tags.clear();
+    caption.folders = std::move(caption.scan.folders);
+    caption.page = 0;
+    const RECT work = WorkArea(caption.controller);
+    for (const auto& text : caption.scan.tags) {
+        if (auto tag = CreateTag(caption, text, work)) caption.tags.push_back(std::move(tag));
+    }
+    const bool empty = caption.scan.tags.empty();
+    caption.scan = {};
+    if (caption.tags.empty()) {
+        PostQuitMessage(empty ? 0 : 1);
+    } else {
+        ActivateTags(caption);
+    }
+}
+
+LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_NCCREATE) {
         const auto create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
     }
-    auto* panel = reinterpret_cast<Panel*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (!panel) return DefWindowProcW(window, message, wParam, lParam);
+    auto* caption = reinterpret_cast<Caption*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!caption) return DefWindowProcW(window, message, wParam, lParam);
 
     switch (message) {
-    case WM_CREATE:
-        panel->window = window;
-        panel->monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
-        panel->status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
-                                      0, 0, 0, 0, window, nullptr, panel->instance, nullptr);
-        panel->previous = CreateWindowW(L"BUTTON", L"上一页", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                        0, 0, 0, 0, window, reinterpret_cast<HMENU>(kPrevious), panel->instance, nullptr);
-        panel->next = CreateWindowW(L"BUTTON", L"下一页", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                    0, 0, 0, 0, window, reinterpret_cast<HMENU>(kNext), panel->instance, nullptr);
-        if (!panel->status || !panel->previous || !panel->next) return -1;
-        LayoutPanel(*panel);
+    case kScanComplete:
+        ShowScanResult(*caption);
         return 0;
-    case WM_DPICHANGED: {
-        const auto& bounds = *reinterpret_cast<const RECT*>(lParam);
-        SetWindowPos(window, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
-                     bounds.bottom - bounds.top, SWP_NOACTIVATE | SWP_NOZORDER);
-        LayoutPanel(*panel);
-        PostMessageW(window, kReflow, 0, 0);
+    case kActivate:
+        if (!caption->tags.empty()) ActivateTags(*caption);
         return 0;
-    }
-    case WM_MOVE:
-        if (!IsIconic(window)) {
-            const auto monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
-            if (monitor != panel->monitor) {
-                panel->monitor = monitor;
-                PostMessageW(window, kReflow, 0, 0);
-            }
-        }
-        break;
     case WM_SETTINGCHANGE:
         if (wParam != SPI_SETWORKAREA) break;
         [[fallthrough]];
@@ -405,45 +440,38 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         PostMessageW(window, kReflow, 0, 0);
         return 0;
     case kReflow:
-        if (panel->refresh) panel->refresh->positioned = false;
-        for (auto& tag : panel->tags) tag->positioned = false;
-        LayoutTags(*panel);
+        for (auto& tag : caption->tags) tag->positioned = false;
+        if (!caption->tags.empty()) LayoutTags(*caption);
         return 0;
-    case kRefresh:
-        RefreshTags(*panel);
-        return 0;
-    case WM_COMMAND:
-        if (HIWORD(wParam) != BN_CLICKED) break;
-        if (LOWORD(wParam) == kPrevious && panel->page > 0) {
-            --panel->page;
-        } else if (LOWORD(wParam) == kNext && IsWindowEnabled(panel->next)) {
-            ++panel->page;
-        } else {
-            break;
+    case kMenuCommand:
+        if (wParam == kPrevious && caption->page > 0) {
+            --caption->page;
+            ActivateTags(*caption);
+        } else if (wParam == kNext && caption->page + 1 < caption->pageCount) {
+            ++caption->page;
+            ActivateTags(*caption);
+        } else if (wParam == kRefresh) {
+            StartScan(*caption);
+        } else if (wParam == kExit) {
+            PostQuitMessage(0);
         }
-        LayoutTags(*panel);
         return 0;
-    case WM_DESTROY:
+    case WM_CLOSE:
         PostQuitMessage(0);
         return 0;
-    case WM_NCDESTROY:
-        panel->window = nullptr;
-        break;
     }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-int Run(HINSTANCE instance, int showCommand) {
+int Run(HINSTANCE instance) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    Panel panel{instance, tagsearch::ResolveSearchFolders(GetCommandLineW())};
+    Caption caption{instance};
 
-    WNDCLASSW panelClass{};
-    panelClass.hInstance = instance;
-    panelClass.lpfnWndProc = PanelProc;
-    panelClass.lpszClassName = kPanelClass;
-    panelClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    panelClass.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
-    if (!RegisterClassW(&panelClass)) return 1;
+    WNDCLASSW controllerClass{};
+    controllerClass.hInstance = instance;
+    controllerClass.lpfnWndProc = ControllerProc;
+    controllerClass.lpszClassName = kControllerClass;
+    if (!RegisterClassW(&controllerClass)) return 1;
 
     WNDCLASSW tagClass{};
     tagClass.hInstance = instance;
@@ -452,38 +480,61 @@ int Run(HINSTANCE instance, int showCommand) {
     tagClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
     if (!RegisterClassW(&tagClass)) return 1;
 
-    const auto work = WorkArea(nullptr);
-    const UINT dpi = GetDpiForSystem();
-    constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT frame{0, 0, Scale(290, dpi), Scale(77, dpi)};
-    AdjustWindowRectExForDpi(&frame, style, FALSE, 0, dpi);
-    const int width = frame.right - frame.left;
-    const int height = frame.bottom - frame.top;
-    const HWND window = CreateWindowW(kPanelClass, L"TagSearch · Caption", style,
-        work.right - width, work.top, width, height, nullptr, nullptr, instance, &panel);
-    if (!window) return 1;
+    const RECT work = WorkArea(nullptr);
+    caption.controller = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kControllerClass, nullptr, WS_POPUP, work.left, work.top, 1, 1,
+        nullptr, nullptr, instance, &caption);
+    if (!caption.controller || !StartScan(caption)) return 1;
 
-    panel.refresh = CreateTag(panel, L"↺", true);
-    if (!panel.refresh) return 1;
-    ShowWindow(window, showCommand);
-    RefreshTags(panel);
     MSG message{};
     BOOL result;
     while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-        if (GetAncestor(message.hwnd, GA_ROOT) != window || !IsDialogMessageW(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    if (caption.scanner.joinable()) {
+        caption.scanner.request_stop();
+        caption.scanner.join();
     }
     return result < 0 ? 1 : static_cast<int>(message.wParam);
+}
+
+int RunSingleInstance(HINSTANCE instance) {
+    HANDLE rawMutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    const DWORD status = GetLastError();
+    const std::unique_ptr<void, decltype(&CloseHandle)> mutex(rawMutex, &CloseHandle);
+    if (!mutex) return 1;
+
+    if (status == ERROR_ALREADY_EXISTS) {
+        const ULONGLONG deadline = GetTickCount64() + 5000;
+        for (;;) {
+            const DWORD wait = WaitForSingleObject(mutex.get(), 0);
+            if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) break;
+            if (wait != WAIT_TIMEOUT || GetTickCount64() >= deadline) return 1;
+
+            if (const HWND existing = FindWindowW(kControllerClass, nullptr)) {
+                DWORD pid = 0;
+                if (GetWindowThreadProcessId(existing, &pid)) {
+                    AllowSetForegroundWindow(pid);
+                    if (PostMessageW(existing, kActivate, 0, 0)) return 0;
+                }
+            }
+            Sleep(25);
+        }
+    }
+
+    int result = 1;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        result = Run(instance);
+        CoUninitialize();
+    }
+    ReleaseMutex(mutex.get());
+    return result;
 }
 
 } // namespace
 
 _Use_decl_annotations_
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
-    const int result = Run(instance, showCommand);
-    CoUninitialize();
-    return result;
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
+    return RunSingleInstance(instance);
 }
