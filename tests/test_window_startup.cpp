@@ -223,6 +223,8 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     const Process first(copy.executable, {copy.directory});
     const HWND anchor = WaitForPanel(first, L"TagSearchCaptionController");
     WaitForTitle(anchor, L"↺");
+    Expect(GetWindow(anchor, GW_OWNER) == nullptr,
+           "the refresh window should be the visible root without a hidden owner");
     RECT anchorBounds{};
     MONITORINFO monitor{sizeof(monitor)};
     const POINT origin{};

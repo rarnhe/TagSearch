@@ -302,10 +302,14 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             if (GetCursorPos(&point) && (tag->dragging || PastDragThreshold(window, *tag, point))) {
                 tag->dragging = true;
                 RECT bounds{};
-                GetWindowRect(window, &bounds);
-                SetWindowPos(window, nullptr, bounds.left + point.x - tag->last.x,
-                             bounds.top + point.y - tag->last.y, 0, 0,
-                             SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+                const RECT work = PrimaryWorkArea();
+                if (GetWindowRect(window, &bounds) && !IsRectEmpty(&work)) {
+                    const LONG maxX = std::max(work.left, work.right - (bounds.right - bounds.left));
+                    const LONG maxY = std::max(work.top, work.bottom - (bounds.bottom - bounds.top));
+                    const LONG x = std::clamp(bounds.left + point.x - tag->last.x, work.left, maxX);
+                    const LONG y = std::clamp(bounds.top + point.y - tag->last.y, work.top, maxY);
+                    SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+                }
                 tag->last = point;
             }
             return 0;
