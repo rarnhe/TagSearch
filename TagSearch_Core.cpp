@@ -213,6 +213,11 @@ std::vector<TagSearchTerm> TermsForOverlappingWindows(
             terms.push_back({std::wstring(candidate.tag), candidate.operation});
         }
     }
+    // A tag's mode should have the same effect whichever window is clicked
+    // when the overlap selects the same group.
+    std::stable_sort(terms.begin(), terms.end(), [](const auto& left, const auto& right) {
+        return left.operation < right.operation;
+    });
     return terms;
 }
 

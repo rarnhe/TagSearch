@@ -314,6 +314,16 @@ void MixedTagQueryMatchesWindowsSearchOrder() {
     const std::array<tagsearch::TagSearchTerm, 3> terms{{
         {L"tagA"}, {L"tagB", TagOperator::Or}, {L"tagC", TagOperator::Not},
     }};
+    const std::array<tagsearch::TagWindowBounds, 3> overlapping{{
+        {{0, 0, 12, 12}, L"tagC", TagOperator::Not},
+        {{2, 2, 14, 14}, L"tagB", TagOperator::Or},
+        {{4, 4, 16, 16}, L"tagA"},
+    }};
+    const std::vector<tagsearch::TagSearchTerm> expected(terms.begin(), terms.end());
+    for (const auto& clicked : overlapping) {
+        ExpectEqual(tagsearch::TermsForOverlappingWindows(clicked, overlapping), expected,
+                    "clicking any window in the same group should retain AND, OR, and NOT precedence");
+    }
     ExpectEqual(tagsearch::FormatTagQuery(terms), std::wstring(L"AND tagA OR tagB NOT tagC"),
                 "the query string should show the selected operator for each tag");
     Microsoft::WRL::ComPtr<ICondition> condition;
