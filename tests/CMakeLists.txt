@@ -33,14 +33,18 @@ foreach(case IN LISTS cases)
     set_tests_properties(${case} PROPERTIES TIMEOUT 20 RUN_SERIAL TRUE)
 endforeach()
 
-add_executable(tagsearch_treeview_startup_test test_treeview_startup.cpp)
-target_link_libraries(tagsearch_treeview_startup_test PRIVATE TagSearchCore)
-target_compile_options(tagsearch_treeview_startup_test PRIVATE /utf-8)
-add_dependencies(tagsearch_treeview_startup_test TagSearch_TreeView)
+add_executable(tagsearch_window_startup_test test_window_startup.cpp)
+target_link_libraries(tagsearch_window_startup_test PRIVATE TagSearchCore)
+target_compile_options(tagsearch_window_startup_test PRIVATE /utf-8)
+add_dependencies(tagsearch_window_startup_test TagSearch_TreeView TagSearch_Caption)
 
 add_test(NAME treeview_single_instance_startup
-         COMMAND tagsearch_treeview_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
+         COMMAND tagsearch_window_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
 add_test(NAME treeview_fixed_window_and_folder_title
-         COMMAND tagsearch_treeview_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+         COMMAND tagsearch_window_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+add_test(NAME caption_refresh_anchor_and_tag_windows
+         COMMAND tagsearch_window_startup_test caption $<TARGET_FILE:TagSearch_Caption>
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
+                     caption_refresh_anchor_and_tag_windows
                      PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)

@@ -2,6 +2,7 @@
 
 #include <shlobj.h>
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -66,7 +67,7 @@ struct Process {
         }
         Expect(CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
                              nullptr, nullptr, &startup, &info) != FALSE,
-               "CreateProcessW should launch TreeView");
+               "CreateProcessW should launch TagSearch");
         CloseHandle(info.hThread);
     }
 
@@ -88,10 +89,10 @@ struct Process {
     }
 };
 
-HWND WaitForPanel(const Process& process) {
+HWND WaitForPanel(const Process& process, const wchar_t* className = L"TagSearchTreeView") {
     HWND window = nullptr;
     Expect(WaitUntil([&] {
-        window = FindWindowW(L"TagSearchTreeView", nullptr);
+        window = FindWindowW(className, nullptr);
         DWORD processId = 0;
         return window && GetWindowThreadProcessId(window, &processId) &&
                processId == process.info.dwProcessId && IsWindowVisible(window);
@@ -192,17 +193,89 @@ void CheckFixedWindowAndTitle(const fs::path& executable) {
     ClosePanel(window, process);
 }
 
+struct VisibleTags {
+    HWND anchor;
+    std::vector<RECT> bounds;
+    tagsearch::Tags titles;
+};
+
+BOOL CALLBACK RecordVisibleTags(HWND window, LPARAM parameter) {
+    auto& tags = *reinterpret_cast<VisibleTags*>(parameter);
+    RECT rect{};
+    if (IsWindowVisible(window) && GetWindow(window, GW_OWNER) == tags.anchor &&
+        GetWindowRect(window, &rect)) {
+        std::array<wchar_t, 128> title{};
+        GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+        tags.bounds.push_back(rect);
+        tags.titles.emplace_back(title.data());
+    }
+    return TRUE;
+}
+
+bool Within(const RECT& rect, const RECT& area) {
+    return rect.left >= area.left && rect.top >= area.top &&
+           rect.right <= area.right && rect.bottom <= area.bottom;
+}
+
+void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
+    const TestCopy copy(executable);
+    fs::copy_file(fixture, copy.directory / L"tagged.jpg");
+    const Process first(copy.executable, {copy.directory});
+    const HWND anchor = WaitForPanel(first, L"TagSearchCaptionController");
+    WaitForTitle(anchor, L"↺");
+    RECT anchorBounds{};
+    MONITORINFO monitor{sizeof(monitor)};
+    const POINT origin{};
+    Expect(GetWindowRect(anchor, &anchorBounds) &&
+           GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor) &&
+           Within(anchorBounds, monitor.rcWork),
+           "the visible refresh window should start entirely inside the primary work area");
+
+    DWORD_PTR result = 0;
+    Expect(SendMessageTimeoutW(anchor, WM_CONTEXTMENU, 0, -1, SMTO_ABORTIFHUNG,
+                               1000, &result) && result == 0,
+           "the refresh window should dismiss the context-menu message without opening a menu");
+
+    VisibleTags tags{anchor};
+    const DWORD threadId = GetWindowThreadProcessId(anchor, nullptr);
+    Expect(WaitUntil([&] {
+        tags.bounds.clear();
+        tags.titles.clear();
+        EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
+        return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
+               std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
+    }), "the background scan should show both real labels read from the JPEG fixture");
+
+    for (std::size_t i = 0; i < tags.bounds.size(); ++i) {
+        const auto& rect = tags.bounds[i];
+        RECT overlap{};
+        Expect(Within(rect, monitor.rcWork), "the tag window must stay inside the primary work area");
+        Expect(!IntersectRect(&overlap, &rect, &anchorBounds), "the tag must not cover the refresh window");
+        for (std::size_t j = 0; j < i; ++j) {
+            Expect(!IntersectRect(&overlap, &rect, &tags.bounds[j]), "the initially placed tag windows must not overlap");
+        }
+    }
+
+    const Process second(copy.executable);
+    second.ExpectSuccessfulExit("Caption's duplicate launch should forward activation and exit");
+    Expect(FindWindowW(L"TagSearchCaptionController", L"↺") == anchor,
+           "the original refresh window should survive a repeated launch");
+    ClosePanel(anchor, first);
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return 2;
+    if (argc < 3 || argc > 4) return 2;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const std::wstring_view mode = argv[1];
-        if (mode == L"startup") {
+        if (mode == L"startup" && argc == 3) {
             CheckStartup(argv[2]);
-        } else if (mode == L"fixed-window") {
+        } else if (mode == L"fixed-window" && argc == 3) {
             CheckFixedWindowAndTitle(argv[2]);
+        } else if (mode == L"caption" && argc == 4) {
+            CheckCaptionLayout(argv[2], argv[3]);
         } else {
             return 2;
         }
