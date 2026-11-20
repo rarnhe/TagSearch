@@ -1,16 +1,25 @@
 #include "TagSearch_Core.h"
-#include "TagSearch_EntryPoint.h"
+#include "TagSearch_Layout.h"
 
 #include <dwmapi.h>
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <random>
 #include <system_error>
 #include <thread>
 #include <utility>
 #include <windowsx.h>
+
+// Each executable supplies this externally linked entry point for the CRT.
+int WINAPI wWinMain(
+    _In_ HINSTANCE instance,
+    _In_opt_ HINSTANCE previousInstance,
+    _In_ LPWSTR commandLine,
+    _In_ int showCommand);
 
 namespace {
 
@@ -20,17 +29,31 @@ constexpr wchar_t kMutexName[] = L"Local\\TagSearch.Caption.AEF63BC1-F7FC-4837-B
 constexpr UINT kActivate = WM_APP + 1;
 constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
-constexpr UINT kMenuCommand = WM_APP + 4;
-constexpr UINT kPrevious = 1;
-constexpr UINT kNext = 2;
-constexpr UINT kRefresh = 3;
-constexpr UINT kExit = 4;
+constexpr UINT kChangePage = WM_APP + 4;
+constexpr UINT kSetTagMode = WM_APP + 5;
+constexpr DWORD kTileStyle = WS_POPUP | WS_CAPTION;
+constexpr DWORD kTileExStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+constexpr wchar_t kRefreshLabel[] = L"↺";
+using tagsearch::TagOperator;
+
+struct TagMode {
+    TagOperator operation;
+    const wchar_t* label;
+    COLORREF color;
+};
+
+constexpr TagMode kTagModes[]{
+    {TagOperator::And, L"AND", RGB(190, 235, 199)},
+    {TagOperator::Or, L"OR", RGB(248, 202, 219)},
+    {TagOperator::Not, L"NOT", RGB(210, 212, 216)},
+};
 
 struct Caption;
 
 struct FloatingTag {
     Caption& caption;
     std::wstring text;
+    TagOperator operation = TagOperator::And;
     HWND window = nullptr;
     bool pressed = false;
     bool dragging = false;
@@ -71,10 +94,35 @@ UINT WindowDpi(HWND window) {
     return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
 }
 
-RECT WorkArea(HWND window) {
+RECT PrimaryWorkArea() {
     MONITORINFO monitor{sizeof(monitor)};
-    GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &monitor);
+    const POINT origin{};
+    GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor);
     return monitor.rcWork;
+}
+
+int TileHeight(UINT dpi) {
+    RECT frame{0, 0, 0, Scale(30, dpi)};
+    AdjustWindowRectExForDpi(&frame, kTileStyle, FALSE, kTileExStyle, dpi);
+    return frame.bottom - frame.top;
+}
+
+RECT RefreshBounds(const RECT& work, UINT dpi, const RECT* previous = nullptr) {
+    const LONG width = std::min<LONG>(Scale(58, dpi), work.right - work.left);
+    const LONG height = std::min<LONG>(TileHeight(dpi), work.bottom - work.top);
+    const LONG maxX = work.right - width;
+    const LONG maxY = work.bottom - height;
+    LONG x;
+    LONG y;
+    if (previous) {
+        x = std::clamp(previous->left, work.left, maxX);
+        y = std::clamp(previous->top, work.top, maxY);
+    } else {
+        std::random_device random;
+        x = std::uniform_int_distribution<LONG>(work.left, maxX)(random);
+        y = std::uniform_int_distribution<LONG>(work.top, maxY)(random);
+    }
+    return {x, y, x + width, y + height};
 }
 
 HFONT MakeFont(int pixels, int weight, const wchar_t* family) {
@@ -112,45 +160,50 @@ double Luminance(COLORREF color) {
            0.0722 * linear(GetBValue(color));
 }
 
-Palette TagPalette() {
+COLORREF AccentColor() {
+    DWORD color = 0;
+    BOOL opaque = FALSE;
+    return SUCCEEDED(DwmGetColorizationColor(&color, &opaque))
+        ? RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+        : GetSysColor(COLOR_ACTIVECAPTION);
+}
+
+COLORREF TagColor(TagOperator operation) {
+    return kTagModes[static_cast<std::size_t>(operation)].color;
+}
+
+Palette TilePalette(COLORREF background, BYTE opacity = 225) {
     HIGHCONTRASTW highContrast{sizeof(highContrast)};
     if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(highContrast), &highContrast, 0) &&
         (highContrast.dwFlags & HCF_HIGHCONTRASTON)) {
         return {GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT), 255};
     }
-
-    DWORD color = 0;
-    BOOL opaque = FALSE;
-    const COLORREF accent = SUCCEEDED(DwmGetColorizationColor(&color, &opaque))
-        ? RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
-        : GetSysColor(COLOR_ACTIVECAPTION);
-    const bool light = Luminance(accent) >= 0.179;
-    const auto tint = [light](int channel) { return light ? (channel + 255) / 2 : channel / 2; };
-    return {RGB(tint(GetRValue(accent)), tint(GetGValue(accent)), tint(GetBValue(accent))),
-            light ? RGB(0, 0, 0) : RGB(255, 255, 255), 225};
+    const COLORREF text = Luminance(background) >= 0.179 ? RGB(0, 0, 0) : RGB(255, 255, 255);
+    return {background, text, opacity};
 }
 
-void ApplyPalette(HWND window) {
-    const auto palette = TagPalette();
+void ApplyPalette(HWND window, COLORREF color, BYTE opacity = 225) {
+    const auto palette = TilePalette(color, opacity);
     SetLayeredWindowAttributes(window, 0, palette.opacity, LWA_ALPHA);
     DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &palette.background, sizeof(COLORREF));
     DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &palette.text, sizeof(COLORREF));
     InvalidateRect(window, nullptr, FALSE);
 }
 
-void PaintTag(HWND window, FloatingTag& tag) {
+void PaintTile(HWND window, Caption& caption, std::wstring_view text, COLORREF color) {
     PAINTSTRUCT paint{};
     const HDC dc = BeginPaint(window, &paint);
     RECT client{};
     GetClientRect(window, &client);
-    const auto palette = TagPalette();
+    const auto palette = TilePalette(color);
     SetDCBrushColor(dc, palette.background);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-    const auto previous = SelectObject(dc, TagFont(tag.caption, WindowDpi(window)));
+    const UINT dpi = WindowDpi(window);
+    const auto previous = SelectObject(dc, TagFont(caption, dpi));
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, palette.text);
-    InflateRect(&client, -Scale(6, WindowDpi(window)), 0);
-    DrawTextW(dc, tag.text.c_str(), -1, &client,
+    InflateRect(&client, -Scale(6, dpi), 0);
+    DrawTextW(dc, text.data(), static_cast<int>(text.size()), &client,
               DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, previous);
     EndPaint(window, &paint);
@@ -171,31 +224,24 @@ void ActivateTag(HWND window, const FloatingTag& tag) {
             RECT bounds{};
             if (other->window != window && IsWindowVisible(other->window) &&
                 GetWindowRect(other->window, &bounds)) {
-                visibleWindows.push_back({bounds, other->text});
+                visibleWindows.push_back({bounds, other->text, other->operation});
             }
         }
     }
-    const auto tags = tagsearch::TagsForOverlappingWindows({selected, tag.text}, visibleWindows);
-    if (!tagsearch::OpenTagSearch(window, tags, tag.caption.folders)) {
+    const auto terms = tagsearch::TermsForOverlappingWindows(
+        {selected, tag.text, tag.operation}, visibleWindows);
+    if (!tagsearch::OpenTagQuery(window, terms, tag.caption.folders)) {
         MessageBoxW(window, L"无法在文件资源管理器中打开标签搜索。", L"TagSearch", MB_OK | MB_ICONWARNING);
     }
 }
 
-void ShowTagMenu(HWND window, const Caption& caption, LPARAM position) {
-    const HWND controller = caption.controller;
-    const bool canGoBack = caption.page > 0;
-    const bool canGoForward = caption.page + 1 < caption.pageCount;
-    const bool scanning = caption.scanner.joinable();
-
+void ShowTagMenu(HWND window, TagOperator operation, LPARAM position) {
     const HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    if (caption.pageCount > 1) {
-        AppendMenuW(menu, MF_STRING | (canGoBack ? MF_ENABLED : MF_GRAYED), kPrevious, L"上一页");
-        AppendMenuW(menu, MF_STRING | (canGoForward ? MF_ENABLED : MF_GRAYED), kNext, L"下一页");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    for (const auto& mode : kTagModes) {
+        AppendMenuW(menu, MF_STRING | (operation == mode.operation ? MF_CHECKED : MF_UNCHECKED),
+                    static_cast<UINT_PTR>(mode.operation) + 1, mode.label);
     }
-    AppendMenuW(menu, MF_STRING | (scanning ? MF_GRAYED : MF_ENABLED), kRefresh, L"刷新标签");
-    AppendMenuW(menu, MF_STRING, kExit, L"退出");
 
     POINT point{GET_X_LPARAM(position), GET_Y_LPARAM(position)};
     if (point.x == -1 && point.y == -1) {
@@ -206,7 +252,11 @@ void ShowTagMenu(HWND window, const Caption& caption, LPARAM position) {
     const auto command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                                         point.x, point.y, 0, window, nullptr);
     DestroyMenu(menu);
-    if (command) PostMessageW(controller, kMenuCommand, command, 0);
+    if (command > 0) PostMessageW(window, kSetTagMode, command, 0);
+}
+
+void ChangePage(HWND controller, WPARAM key) {
+    PostMessageW(controller, kChangePage, key, 0);
 }
 
 LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -223,10 +273,10 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_SYSCOLORCHANGE:
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
-        ApplyPalette(window);
+        ApplyPalette(window, TagColor(tag->operation));
         return 0;
     case WM_PAINT:
-        PaintTag(window, *tag);
+        PaintTile(window, tag->caption, tag->text, TagColor(tag->operation));
         return 0;
     case WM_DPICHANGED: {
         const auto& bounds = *reinterpret_cast<const RECT*>(lParam);
@@ -281,9 +331,27 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             if ((HIWORD(lParam) & KF_REPEAT) == 0) ActivateTag(window, *tag);
             return 0;
         }
+        if (wParam == VK_PRIOR || wParam == VK_NEXT) {
+            ChangePage(tag->caption.controller, wParam);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            PostMessageW(tag->caption.controller, WM_CLOSE, 0, 0);
+            return 0;
+        }
         break;
+    case WM_MOUSEWHEEL:
+        ChangePage(tag->caption.controller, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? VK_PRIOR : VK_NEXT);
+        return 0;
+    case WM_NCRBUTTONUP:
     case WM_CONTEXTMENU:
-        ShowTagMenu(window, tag->caption, lParam);
+        ShowTagMenu(window, tag->operation, lParam);
+        return 0;
+    case kSetTagMode:
+        if (wParam > 0 && wParam <= std::size(kTagModes)) {
+            tag->operation = kTagModes[wParam - 1].operation;
+            ApplyPalette(window, TagColor(tag->operation));
+        }
         return 0;
     case WM_CLOSE:
         PostMessageW(tag->caption.controller, WM_CLOSE, 0, 0);
@@ -292,27 +360,24 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& text, const RECT& work) {
-    auto tag = std::make_unique<FloatingTag>(FloatingTag{caption, text});
-    tag->window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, kTagClass, text.c_str(),
-        WS_POPUP | WS_CAPTION, work.left, work.top, 1, 1, caption.controller, nullptr,
-        caption.instance, tag.get());
+std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& text,
+                                      TagOperator operation, const RECT& work) {
+    auto tag = std::make_unique<FloatingTag>(FloatingTag{caption, text, operation});
+    tag->window = CreateWindowExW(kTileExStyle, kTagClass, text.c_str(), kTileStyle,
+        work.left, work.top, 1, 1, caption.controller, nullptr, caption.instance, tag.get());
     return tag->window ? std::move(tag) : nullptr;
 }
 
 void LayoutTags(Caption& caption) {
     const UINT dpi = WindowDpi(caption.controller);
-    const RECT work = WorkArea(caption.controller);
+    const RECT work = PrimaryWorkArea();
+    RECT anchor{};
+    if (!GetWindowRect(caption.controller, &anchor)) return;
     const int gap = Scale(8, dpi);
-    const int cellWidth = std::max(1, std::min(Scale(230, dpi), int(work.right - work.left) - 2 * gap));
-    RECT frame{0, 0, cellWidth, Scale(30, dpi)};
-    AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION, FALSE, WS_EX_TOOLWINDOW, dpi);
-    const int cellHeight = frame.bottom - frame.top;
-    const int top = work.top + gap;
-    const int rows = std::max(1, int(work.bottom - top) / (cellHeight + gap));
-    const int columns = std::max(1, int(work.right - work.left - gap) / (cellWidth + gap));
-    const auto capacity = static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
-    caption.pageCount = caption.tags.empty() ? 1 : 1 + (caption.tags.size() - 1) / capacity;
+    const LONG cellWidth = std::min<LONG>(Scale(230, dpi), work.right - work.left);
+    const auto slots = tagsearch::CaptionSlots(work, anchor, {cellWidth, TileHeight(dpi)}, gap);
+    const auto capacity = slots.size();
+    caption.pageCount = capacity && !caption.tags.empty() ? 1 + (caption.tags.size() - 1) / capacity : 1;
     caption.page = std::min(caption.page, caption.pageCount - 1);
     const std::size_t first = caption.page * capacity;
     const std::size_t last = first + std::min(capacity, caption.tags.size() - first);
@@ -327,16 +392,14 @@ void LayoutTags(Caption& caption) {
         }
 
         if (!tag.positioned) {
+            const RECT& slot = slots[i - first];
             SIZE text{};
             if (dc) GetTextExtentPoint32W(dc, tag.text.c_str(), static_cast<int>(tag.text.size()), &text);
-            const int width = std::min(cellWidth, std::max(Scale(52, dpi), static_cast<int>(text.cx) + Scale(36, dpi)));
-            const auto slot = i - first;
-            const int column = static_cast<int>(slot / rows);
-            const int row = static_cast<int>(slot % rows);
-            const int right = work.right - gap - column * (cellWidth + gap);
-            const int x = std::max(static_cast<int>(work.left), right - width);
-            const int y = top + row * (cellHeight + gap);
-            SetWindowPos(tag.window, nullptr, x, y, width, cellHeight, SWP_NOACTIVATE | SWP_NOZORDER);
+            const int width = std::min(static_cast<int>(slot.right - slot.left),
+                std::max(Scale(52, dpi), static_cast<int>(text.cx) + Scale(36, dpi)));
+            const LONG x = slot.left + (slot.right - slot.left - width) / 2;
+            SetWindowPos(tag.window, nullptr, x, slot.top, width, slot.bottom - slot.top,
+                         SWP_NOACTIVATE | SWP_NOZORDER);
             tag.positioned = true;
         }
         ShowWindow(tag.window, SW_SHOWNA);
@@ -348,6 +411,10 @@ void LayoutTags(Caption& caption) {
 }
 
 void ActivateTags(Caption& caption) {
+    if (IsIconic(caption.controller)) ShowWindow(caption.controller, SW_RESTORE);
+    ShowWindow(caption.controller, SW_SHOWNA);
+    SetWindowPos(caption.controller, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     LayoutTags(caption);
     // Preserve the stacking order of overlapping tags when bringing the page forward.
     std::vector<HWND> windows;
@@ -361,7 +428,7 @@ void ActivateTags(Caption& caption) {
         SetWindowPos(*i, HWND_TOP, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
-    if (!windows.empty()) SetForegroundWindow(windows.front());
+    SetForegroundWindow(windows.empty() ? caption.controller : windows.front());
 }
 
 void ScanInBackground(Caption& caption, std::stop_token stop) {
@@ -396,26 +463,24 @@ bool StartScan(Caption& caption) {
 void ShowScanResult(Caption& caption) {
     if (!caption.scanner.joinable()) return;
     caption.scanner.join();
-    if (!caption.scan.success) {
-        if (caption.tags.empty()) PostQuitMessage(1);
-        return;
-    }
+    if (!caption.scan.success) return;
 
-    for (const auto& tag : caption.tags) DestroyWindow(tag->window);
+    std::map<std::wstring, TagOperator> previousModes;
+    for (const auto& tag : caption.tags) {
+        previousModes.emplace(tag->text, tag->operation);
+        DestroyWindow(tag->window);
+    }
     caption.tags.clear();
     caption.folders = std::move(caption.scan.folders);
     caption.page = 0;
-    const RECT work = WorkArea(caption.controller);
+    const RECT work = PrimaryWorkArea();
     for (const auto& text : caption.scan.tags) {
-        if (auto tag = CreateTag(caption, text, work)) caption.tags.push_back(std::move(tag));
+        const auto previous = previousModes.find(text);
+        const auto mode = previous == previousModes.end() ? TagOperator::And : previous->second;
+        if (auto tag = CreateTag(caption, text, mode, work)) caption.tags.push_back(std::move(tag));
     }
-    const bool empty = caption.scan.tags.empty();
     caption.scan = {};
-    if (caption.tags.empty()) {
-        PostQuitMessage(empty ? 0 : 1);
-    } else {
-        ActivateTags(caption);
-    }
+    ActivateTags(caption);
 }
 
 LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -427,33 +492,77 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     if (!caption) return DefWindowProcW(window, message, wParam, lParam);
 
     switch (message) {
+    case WM_CREATE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_SYSCOLORCHANGE:
+    case WM_THEMECHANGED:
+        ApplyPalette(window, AccentColor(), 255);
+        return 0;
+    case WM_PAINT:
+        PaintTile(window, *caption, kRefreshLabel, AccentColor());
+        return 0;
+    case WM_NCHITTEST: {
+        const auto hit = DefWindowProcW(window, message, wParam, lParam);
+        return hit == HTCAPTION ? HTCLIENT : hit;
+    }
+    case WM_LBUTTONUP:
+        StartScan(*caption);
+        return 0;
+    case WM_NCRBUTTONUP:
+    case WM_CONTEXTMENU:
+        return 0;
+    case WM_MOUSEWHEEL:
+        ChangePage(window, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? VK_PRIOR : VK_NEXT);
+        return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            if ((HIWORD(lParam) & KF_REPEAT) == 0) StartScan(*caption);
+            return 0;
+        }
+        if (wParam == VK_PRIOR || wParam == VK_NEXT) {
+            ChangePage(window, wParam);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            PostQuitMessage(0);
+            return 0;
+        }
+        break;
     case kScanComplete:
         ShowScanResult(*caption);
         return 0;
     case kActivate:
-        if (!caption->tags.empty()) ActivateTags(*caption);
+        ActivateTags(*caption);
         return 0;
     case WM_SETTINGCHANGE:
-        if (wParam != SPI_SETWORKAREA) break;
+        if (wParam != SPI_SETWORKAREA) {
+            ApplyPalette(window, AccentColor(), 255);
+            return 0;
+        }
         [[fallthrough]];
+    case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
         PostMessageW(window, kReflow, 0, 0);
         return 0;
-    case kReflow:
-        for (auto& tag : caption->tags) tag->positioned = false;
-        if (!caption->tags.empty()) LayoutTags(*caption);
+    case kReflow: {
+        RECT previous{};
+        const RECT work = PrimaryWorkArea();
+        if (GetWindowRect(window, &previous) && !IsRectEmpty(&work)) {
+            const auto bounds = RefreshBounds(work, WindowDpi(window), &previous);
+            SetWindowPos(window, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
+                         bounds.bottom - bounds.top, SWP_NOACTIVATE | SWP_NOZORDER);
+            for (auto& tag : caption->tags) tag->positioned = false;
+            LayoutTags(*caption);
+        }
         return 0;
-    case kMenuCommand:
-        if (wParam == kPrevious && caption->page > 0) {
+    }
+    case kChangePage:
+        if (wParam == VK_PRIOR && caption->page > 0) {
             --caption->page;
             ActivateTags(*caption);
-        } else if (wParam == kNext && caption->page + 1 < caption->pageCount) {
+        } else if (wParam == VK_NEXT && caption->page + 1 < caption->pageCount) {
             ++caption->page;
             ActivateTags(*caption);
-        } else if (wParam == kRefresh) {
-            StartScan(*caption);
-        } else if (wParam == kExit) {
-            PostQuitMessage(0);
         }
         return 0;
     case WM_CLOSE:
@@ -471,6 +580,7 @@ int Run(HINSTANCE instance) {
     controllerClass.hInstance = instance;
     controllerClass.lpfnWndProc = ControllerProc;
     controllerClass.lpszClassName = kControllerClass;
+    controllerClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
     if (!RegisterClassW(&controllerClass)) return 1;
 
     WNDCLASSW tagClass{};
@@ -480,11 +590,17 @@ int Run(HINSTANCE instance) {
     tagClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
     if (!RegisterClassW(&tagClass)) return 1;
 
-    const RECT work = WorkArea(nullptr);
-    caption.controller = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        kControllerClass, nullptr, WS_POPUP, work.left, work.top, 1, 1,
+    const RECT work = PrimaryWorkArea();
+    if (IsRectEmpty(&work)) return 1;
+    const auto bounds = RefreshBounds(work, GetDpiForSystem());
+    caption.controller = CreateWindowExW(kTileExStyle, kControllerClass, kRefreshLabel,
+        kTileStyle, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
         nullptr, nullptr, instance, &caption);
-    if (!caption.controller || !StartScan(caption)) return 1;
+    if (!caption.controller) return 1;
+
+    ShowWindow(caption.controller, SW_SHOWNORMAL);
+    UpdateWindow(caption.controller);
+    if (!StartScan(caption)) return 1;
 
     MSG message{};
     BOOL result;

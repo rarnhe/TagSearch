@@ -203,57 +203,108 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
     return stop.stop_requested() ? Tags{} : NormalizeTags(std::move(tags));
 }
 
-Tags TagsForOverlappingWindows(
-    const TagWindowBounds& selected, const std::vector<TagWindowBounds>& visibleWindows) {
-    Tags tags{std::wstring(selected.tag)};
+std::vector<TagSearchTerm> TermsForOverlappingWindows(
+    const TagWindowBounds& selected, std::span<const TagWindowBounds> visibleWindows) {
+    std::vector<TagSearchTerm> terms{{std::wstring(selected.tag), selected.operation}};
     for (const auto& candidate : visibleWindows) {
         RECT intersection{};
         if (IntersectRect(&intersection, &selected.bounds, &candidate.bounds) &&
-            std::find(tags.begin(), tags.end(), candidate.tag) == tags.end()) {
-            tags.emplace_back(candidate.tag);
+            std::none_of(terms.begin(), terms.end(), [&](const auto& term) { return term.tag == candidate.tag; })) {
+            terms.push_back({std::wstring(candidate.tag), candidate.operation});
         }
     }
-    return tags;
+    return terms;
 }
 
-HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result) {
+std::wstring FormatTagQuery(std::span<const TagSearchTerm> terms) {
+    std::wstring text;
+    for (const auto& term : terms) {
+        if (!text.empty()) text += L' ';
+        switch (term.operation) {
+        case TagOperator::And: text += L"AND "; break;
+        case TagOperator::Or: text += L"OR "; break;
+        case TagOperator::Not: text += L"NOT "; break;
+        }
+        text += term.tag;
+    }
+    return text;
+}
+
+namespace {
+
+std::vector<TagSearchTerm> AndTerms(const Tags& tags) {
+    std::vector<TagSearchTerm> terms;
+    terms.reserve(tags.size());
+    for (const auto& tag : tags) terms.push_back({tag});
+    return terms;
+}
+
+HRESULT CombineTerms(IConditionFactory2& factory, CONDITION_TYPE type,
+                     const std::vector<ComPtr<ICondition>>& terms, ICondition** result) {
+    if (terms.size() == 1) return terms.front().CopyTo(result);
+
+    std::vector<ICondition*> children;
+    children.reserve(terms.size());
+    for (const auto& term : terms) children.push_back(term.Get());
+    return factory.CreateCompoundFromArray(type, children.data(), static_cast<ULONG>(children.size()),
+                                           CONDITION_CREATION_NONE, IID_PPV_ARGS(result));
+}
+
+} // namespace
+
+HRESULT CreateTagQueryCondition(std::span<const TagSearchTerm> terms, ICondition** result) {
     if (!result) return E_POINTER;
     *result = nullptr;
-    if (tags.empty() || std::any_of(tags.begin(), tags.end(), [](const auto& tag) { return tag.empty(); })) {
+    if (terms.empty() || std::any_of(terms.begin(), terms.end(), [](const auto& term) { return term.tag.empty(); })) {
         return E_INVALIDARG;
     }
 
     ComPtr<IConditionFactory2> factory;
     HRESULT hr = CoCreateInstance(CLSID_ConditionFactory, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(factory.GetAddressOf()));
-    if (FAILED(hr)) {
-        return hr;
-    }
+    if (FAILED(hr)) return hr;
 
-    std::vector<ComPtr<ICondition>> leaves;
-    std::vector<ICondition*> children;
-    leaves.reserve(tags.size());
-    children.reserve(tags.size());
-    for (const auto& tag : tags) {
-        auto& leaf = leaves.emplace_back();
-        hr = factory->CreateStringLeaf(PKEY_Keywords, COP_EQUAL, tag.c_str(), nullptr,
+    // AQS binds binary operators from left to right. Fold runs of the same
+    // operator together, using AND NOT to append a negated term.
+    std::vector<ComPtr<ICondition>> group;
+    CONDITION_TYPE groupType = CT_AND_CONDITION;
+    for (const auto& term : terms) {
+        ComPtr<ICondition> leaf;
+        hr = factory->CreateStringLeaf(PKEY_Keywords, COP_EQUAL, term.tag.c_str(), nullptr,
                                        CONDITION_CREATION_NONE, IID_PPV_ARGS(leaf.GetAddressOf()));
-        if (FAILED(hr)) {
-            return hr;
+        if (FAILED(hr)) return hr;
+        if (term.operation == TagOperator::Not) {
+            ComPtr<ICondition> negated;
+            hr = factory->MakeNot(leaf.Get(), FALSE, negated.GetAddressOf());
+            if (FAILED(hr)) return hr;
+            leaf = std::move(negated);
         }
-        children.push_back(leaf.Get());
+
+        if (!group.empty()) {
+            const CONDITION_TYPE nextType = term.operation == TagOperator::Or ? CT_OR_CONDITION : CT_AND_CONDITION;
+            if (group.size() > 1 && nextType != groupType) {
+                ComPtr<ICondition> combined;
+                hr = CombineTerms(*factory.Get(), groupType, group, combined.GetAddressOf());
+                if (FAILED(hr)) return hr;
+                group.clear();
+                group.push_back(std::move(combined));
+            }
+            groupType = nextType;
+        }
+        group.push_back(std::move(leaf));
     }
 
-    if (leaves.size() == 1) {
-        *result = leaves.front().Detach();
-        return S_OK;
-    }
-    return factory->CreateCompoundFromArray(CT_AND_CONDITION, children.data(),
-                                            static_cast<ULONG>(children.size()),
-                                            CONDITION_CREATION_NONE, IID_PPV_ARGS(result));
+    return CombineTerms(*factory.Get(), groupType, group, result);
 }
 
-HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result) {
+HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result) {
+    return CreateTagQueryCondition(AndTerms(tags), result);
+}
+
+namespace {
+
+HRESULT CreateSearchFolder(std::span<const TagSearchTerm> terms, const std::wstring& name,
+                           const Folders& folders, PIDLIST_ABSOLUTE* result) {
     if (!result) return E_POINTER;
     *result = nullptr;
 
@@ -278,14 +329,9 @@ HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_
     }
 
     ComPtr<ICondition> condition;
-    hr = CreateTagSearchCondition(tags, condition.GetAddressOf());
+    hr = CreateTagQueryCondition(terms, condition.GetAddressOf());
     if (FAILED(hr)) {
         return hr;
-    }
-
-    std::wstring name = tags.front();
-    for (std::size_t i = 1; i < tags.size(); ++i) {
-        name += L" AND " + tags[i];
     }
 
     ComPtr<ISearchFolderItemFactory> search;
@@ -297,9 +343,7 @@ HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_
     return SUCCEEDED(hr) ? search->GetIDList(result) : hr;
 }
 
-bool OpenTagSearch(HWND owner, const Tags& tags, const Folders& folders) {
-    PIDLIST_ABSOLUTE id = nullptr;
-    const HRESULT hr = CreateTagSearchFolder(tags, folders, &id);
+bool OpenSearchFolder(HWND owner, PIDLIST_ABSOLUTE id, HRESULT hr) {
     const Pidl search(id, &CoTaskMemFree);
     if (FAILED(hr)) {
         return false;
@@ -311,6 +355,33 @@ bool OpenTagSearch(HWND owner, const Tags& tags, const Folders& folders) {
     execute.lpIDList = search.get();
     execute.nShow = SW_SHOWNORMAL;
     return ShellExecuteExW(&execute) != FALSE;
+}
+
+} // namespace
+
+HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result) {
+    std::wstring name;
+    for (const auto& tag : tags) {
+        if (!name.empty()) name += L" AND ";
+        name += tag;
+    }
+    return CreateSearchFolder(AndTerms(tags), name, folders, result);
+}
+
+HRESULT CreateTagQueryFolder(std::span<const TagSearchTerm> terms, const Folders& folders, PIDLIST_ABSOLUTE* result) {
+    return CreateSearchFolder(terms, FormatTagQuery(terms), folders, result);
+}
+
+bool OpenTagSearch(HWND owner, const Tags& tags, const Folders& folders) {
+    PIDLIST_ABSOLUTE id = nullptr;
+    const HRESULT hr = CreateTagSearchFolder(tags, folders, &id);
+    return OpenSearchFolder(owner, id, hr);
+}
+
+bool OpenTagQuery(HWND owner, std::span<const TagSearchTerm> terms, const Folders& folders) {
+    PIDLIST_ABSOLUTE id = nullptr;
+    const HRESULT hr = CreateTagQueryFolder(terms, folders, &id);
+    return OpenSearchFolder(owner, id, hr);
 }
 
 } // namespace tagsearch

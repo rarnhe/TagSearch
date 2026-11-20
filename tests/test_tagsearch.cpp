@@ -1,4 +1,5 @@
 #include "TagSearch_Core.h"
+#include "TagSearch_Layout.h"
 
 #include <propvarutil.h>
 #include <shlobj.h>
@@ -6,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -174,13 +176,13 @@ void OverlapFindsAllDirectIntersections() {
     const tagsearch::TagWindowBounds selected{{-40, 0, 60, 40}, L"A"};
     const std::vector<tagsearch::TagWindowBounds> visible{
         selected,
-        {{30, 0, 90, 40}, L"B"},
+        {{30, 0, 90, 40}, L"B", tagsearch::TagOperator::Or},
         {{70, 0, 110, 40}, L"chain-only"},
-        {{-100, 10, -20, 30}, L"C"},
-        {{30, 0, 90, 40}, L"B"},
+        {{-100, 10, -20, 30}, L"C", tagsearch::TagOperator::Not},
+        {{30, 0, 90, 40}, L"B", tagsearch::TagOperator::Or},
     };
-    ExpectEqual(tagsearch::TagsForOverlappingWindows(selected, visible),
-                tagsearch::Tags{L"A", L"B", L"C"},
+    ExpectEqual(tagsearch::TermsForOverlappingWindows(selected, visible),
+                std::vector<tagsearch::TagSearchTerm>{{L"A"}, {L"B", tagsearch::TagOperator::Or}, {L"C", tagsearch::TagOperator::Not}},
                 "each directly overlapping tag should occur once, including on negative coordinates");
 }
 
@@ -192,7 +194,7 @@ void OverlapIgnoresTouchingEdgesAndCorners() {
         {{20, 0, 20, 80}, L"empty"},
         {{110, 0, 150, 50}, L"separate"},
     };
-    ExpectEqual(tagsearch::TagsForOverlappingWindows(selected, visible), tagsearch::Tags{L"A"},
+    ExpectEqual(tagsearch::TermsForOverlappingWindows(selected, visible), std::vector<tagsearch::TagSearchTerm>{{L"A"}},
                 "the selected tag should remain a single-tag search when there is no common area");
 }
 
@@ -225,39 +227,123 @@ void SearchConditionKeepsOneTagLiteral() {
     ExpectEqual(ExactKeyword(*condition.Get()), literal, "AND inside a label must remain part of the tag");
 }
 
-void SearchConditionCombinesAllTagsWithAnd() {
-    const tagsearch::TagWindowBounds selected{{0, 0, 4, 4}, L"项目 & \"资料\""};
-    const auto tags = tagsearch::TagsForOverlappingWindows(selected, {
-        {{0, 0, 2, 2}, L"发布 AND 归档"},
-        {{2, 2, 4, 4}, L"版本 100%"},
-        {{5, 5, 6, 6}, L"outside"},
-    });
-
-    Microsoft::WRL::ComPtr<ICondition> condition;
-    Expect(SUCCEEDED(tagsearch::CreateTagSearchCondition(tags, condition.GetAddressOf())),
-           "overlapping tags should create a Shell condition");
+CONDITION_TYPE ConditionType(ICondition& condition) {
     CONDITION_TYPE type{};
-    Expect(SUCCEEDED(condition->GetConditionType(&type)) && type == CT_AND_CONDITION,
-           "multiple tags must be combined with a Shell AND node");
+    Expect(SUCCEEDED(condition.GetConditionType(&type)), "a condition should have a readable type");
+    return type;
+}
 
+std::vector<Microsoft::WRL::ComPtr<ICondition>> Children(ICondition& condition) {
     Microsoft::WRL::ComPtr<IEnumUnknown> children;
-    Expect(SUCCEEDED(condition->GetSubConditions(IID_PPV_ARGS(children.GetAddressOf()))),
-           "the AND condition should expose its children");
-    tagsearch::Tags actual;
+    Expect(SUCCEEDED(condition.GetSubConditions(IID_PPV_ARGS(children.GetAddressOf()))),
+           "a compound condition should expose its children");
+    std::vector<Microsoft::WRL::ComPtr<ICondition>> result;
     for (;;) {
         Microsoft::WRL::ComPtr<IUnknown> child;
         ULONG fetched = 0;
-        const auto result = children->Next(1, child.GetAddressOf(), &fetched);
-        if (result == S_FALSE) break;
-        Expect(result == S_OK && fetched == 1, "the child condition should be readable");
-        Microsoft::WRL::ComPtr<ICondition> leaf;
-        Expect(SUCCEEDED(child.As(&leaf)), "the child should implement ICondition");
-        actual.push_back(ExactKeyword(*leaf.Get()));
+        const auto hr = children->Next(1, child.GetAddressOf(), &fetched);
+        if (hr == S_FALSE) break;
+        Expect(hr == S_OK && fetched == 1, "the child condition should be readable");
+        Expect(SUCCEEDED(child.As(&result.emplace_back())), "the child should implement ICondition");
     }
-    auto expected = tags;
+    return result;
+}
+
+void SearchConditionCombinesAllTagsWithAnd() {
+    const tagsearch::TagWindowBounds selected{{0, 0, 4, 4}, L"项目 & \"资料\""};
+    const std::array<tagsearch::TagWindowBounds, 3> candidates{{
+        {{0, 0, 2, 2}, L"发布 AND 归档"},
+        {{2, 2, 4, 4}, L"版本 100%"},
+        {{5, 5, 6, 6}, L"outside"},
+    }};
+    const auto terms = tagsearch::TermsForOverlappingWindows(selected, candidates);
+    Microsoft::WRL::ComPtr<ICondition> condition;
+    Expect(SUCCEEDED(tagsearch::CreateTagQueryCondition(terms, condition.GetAddressOf())),
+           "overlapping tags should create a Shell condition");
+    Expect(ConditionType(*condition.Get()) == CT_AND_CONDITION, "all AND tags should use one AND node");
+
+    tagsearch::Tags expected;
+    for (const auto& term : terms) expected.push_back(term.tag);
+    tagsearch::Tags actual;
+    for (const auto& leaf : Children(*condition.Get())) actual.push_back(ExactKeyword(*leaf.Get()));
     std::sort(actual.begin(), actual.end());
     std::sort(expected.begin(), expected.end());
     ExpectEqual(actual, expected, "the AND node should hold each tag as a literal keyword");
+}
+
+void CaptionSlotsKeepWindowsInBounds() {
+    const RECT work{-900, -18, 0, 560};
+    const std::array<RECT, 5> anchors{{
+        {-900, -18, -850, 28}, {-50, -18, 0, 28},
+        {-900, 514, -850, 560}, {-50, 514, 0, 560},
+        {-475, 248, -425, 294},
+    }};
+    for (const auto& anchor : anchors) {
+        const auto slots = tagsearch::CaptionSlots(work, anchor, {160, 46}, 8);
+        Expect(!slots.empty(), "each anchor should have room for visible tag windows");
+        double previousDistance = -1;
+        const POINT center{(anchor.left + anchor.right) / 2, (anchor.top + anchor.bottom) / 2};
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            const auto& rect = slots[i];
+            Expect(rect.left >= work.left && rect.top >= work.top && rect.right <= work.right &&
+                   rect.bottom <= work.bottom, "a tag must stay entirely in the work area");
+            RECT overlap{};
+            Expect(!IntersectRect(&overlap, &rect, &anchor), "a tag cannot cover the refresh window");
+            for (std::size_t j = 0; j < i; ++j) {
+                Expect(!IntersectRect(&overlap, &rect, &slots[j]), "new tag windows must be disjoint");
+            }
+            const double dx = (static_cast<double>(rect.left) + rect.right) / 2 - center.x;
+            const double dy = (static_cast<double>(rect.top) + rect.bottom) / 2 - center.y;
+            const double distance = dx * dx + dy * dy;
+            Expect(distance >= previousDistance, "tag slots should go nearest to farthest around the anchor");
+            previousDistance = distance;
+        }
+    }
+}
+
+void CaptionSlotsHandleTightFit() {
+    const RECT work{0, 0, 210, 120};
+    const RECT anchor{78, 50, 132, 70};
+    const auto slots = tagsearch::CaptionSlots(work, anchor, {160, 38}, 6);
+    ExpectEqual(slots.size(), std::size_t{2}, "one tag should fit above the anchor and one below");
+    Expect(tagsearch::CaptionSlots(work, anchor, {211, 38}, 6).empty(), "oversized slots must not escape the desktop");
+}
+
+void MixedTagQueryMatchesWindowsSearchOrder() {
+    using tagsearch::TagOperator;
+    const std::array<tagsearch::TagSearchTerm, 3> terms{{
+        {L"tagA"}, {L"tagB", TagOperator::Or}, {L"tagC", TagOperator::Not},
+    }};
+    ExpectEqual(tagsearch::FormatTagQuery(terms), std::wstring(L"AND tagA OR tagB NOT tagC"),
+                "the query string should show the selected operator for each tag");
+    Microsoft::WRL::ComPtr<ICondition> condition;
+    Expect(SUCCEEDED(tagsearch::CreateTagQueryCondition(terms, condition.GetAddressOf())),
+           "a mixture of tag modes should create a Shell condition");
+    Expect(ConditionType(*condition.Get()) == CT_AND_CONDITION, "NOT should join the preceding OR group with AND");
+    const auto children = Children(*condition.Get());
+    ExpectEqual(children.size(), std::size_t{2}, "the AND root should hold an OR and a NOT");
+    const auto firstIsOr = ConditionType(*children[0].Get()) == CT_OR_CONDITION;
+    auto& either = *children[firstIsOr ? 0 : 1].Get();
+    auto& excluded = *children[firstIsOr ? 1 : 0].Get();
+    Expect(ConditionType(either) == CT_OR_CONDITION && ConditionType(excluded) == CT_NOT_CONDITION,
+           "the Shell tree should implement (tagA OR tagB) AND NOT tagC");
+
+    tagsearch::Tags allowed;
+    for (const auto& child : Children(either)) allowed.push_back(ExactKeyword(*child.Get()));
+    std::sort(allowed.begin(), allowed.end());
+    ExpectEqual(allowed, tagsearch::Tags{L"tagA", L"tagB"}, "the OR should contain the two positive keywords");
+
+    Microsoft::WRL::ComPtr<ICondition> negative;
+    Expect(SUCCEEDED(excluded.GetSubConditions(IID_PPV_ARGS(negative.GetAddressOf()))),
+           "NOT should expose the exact keyword it excludes");
+    ExpectEqual(ExactKeyword(*negative.Get()), std::wstring(L"tagC"), "the NOT should exclude tagC");
+
+    TestDirectory test;
+    PIDLIST_ABSOLUTE id = nullptr;
+    const auto hr = tagsearch::CreateTagQueryFolder(terms, {test.path}, &id);
+    const bool created = SUCCEEDED(hr) && id != nullptr;
+    CoTaskMemFree(id);
+    Expect(created, "Explorer should accept a scoped search folder for the mixed condition");
 }
 
 void CreateSearchFolderAcceptsCombinedTags() {
@@ -295,6 +381,9 @@ int main(int argc, char** argv) {
         {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
         {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
+        {"caption_slots_keep_windows_in_bounds", CaptionSlotsKeepWindowsInBounds},
+        {"caption_slots_handle_tight_fit", CaptionSlotsHandleTightFit},
+        {"mixed_tag_query_matches_windows_search_order", MixedTagQueryMatchesWindowsSearchOrder},
     };
 
     if (argc != 2) {

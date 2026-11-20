@@ -23,6 +23,9 @@ set(cases
     search_condition_keeps_one_tag_literal
     search_condition_combines_all_tags_with_and
     create_search_folder_accepts_combined_tags
+    caption_slots_keep_windows_in_bounds
+    caption_slots_handle_tight_fit
+    mixed_tag_query_matches_windows_search_order
 )
 
 foreach(case IN LISTS cases)
