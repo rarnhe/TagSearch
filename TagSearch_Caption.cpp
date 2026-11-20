@@ -5,22 +5,22 @@
 #endif
 
 #include <algorithm>
-#include <array>
+#include <random>
 
 namespace tagsearch {
-namespace {
 
-void AddSlots(const RECT& area, POINT center, SIZE slot, LONG gap, std::vector<RECT>& slots) {
-    const LONG width = area.right - area.left;
-    const LONG height = area.bottom - area.top;
-    if (slot.cx > width || slot.cy > height) return;
+std::vector<RECT> CaptionSlots(const RECT& workArea, SIZE slot, LONG gap, std::mt19937& random) {
+    const LONG width = workArea.right - workArea.left;
+    const LONG height = workArea.bottom - workArea.top;
+    if (gap < 0 || slot.cx <= 0 || slot.cy <= 0 || slot.cx > width || slot.cy > height) return {};
 
     const LONG columns = 1 + (width - slot.cx) / (slot.cx + gap);
     const LONG rows = 1 + (height - slot.cy) / (slot.cy + gap);
     const LONG spanX = slot.cx + (columns - 1) * (slot.cx + gap);
     const LONG spanY = slot.cy + (rows - 1) * (slot.cy + gap);
-    const LONG originX = std::clamp(center.x - spanX / 2, area.left, area.right - spanX);
-    const LONG originY = std::clamp(center.y - spanY / 2, area.top, area.bottom - spanY);
+    const LONG originX = workArea.left + (width - spanX) / 2;
+    const LONG originY = workArea.top + (height - spanY) / 2;
+    std::vector<RECT> slots;
     for (LONG row = 0; row < rows; ++row) {
         for (LONG column = 0; column < columns; ++column) {
             const LONG x = originX + column * (slot.cx + gap);
@@ -28,46 +28,7 @@ void AddSlots(const RECT& area, POINT center, SIZE slot, LONG gap, std::vector<R
             slots.push_back({x, y, x + slot.cx, y + slot.cy});
         }
     }
-}
-
-} // namespace
-
-std::vector<RECT> CaptionSlots(const RECT& workArea, const RECT& anchor, SIZE slot, LONG gap) {
-    if (gap < 0 || slot.cx <= 0 || slot.cy <= 0 || IsRectEmpty(&workArea)) return {};
-
-    const auto [left, top, right, bottom] = workArea;
-    const POINT center{anchor.left + (anchor.right - anchor.left) / 2,
-                       anchor.top + (anchor.bottom - anchor.top) / 2};
-    const RECT padded{anchor.left - gap, anchor.top - gap, anchor.right + gap, anchor.bottom + gap};
-    std::vector<RECT> slots;
-    RECT reserved{};
-    if (!IntersectRect(&reserved, &workArea, &padded)) {
-        AddSlots(workArea, center, slot, gap, slots);
-    } else {
-        const auto [l, t, r, b] = reserved;
-
-        // Try both ways to partition the available space. Either partition uses
-        // mutually disjoint regions, even if the anchor touches a screen edge.
-        const std::array<RECT, 4> horizontal{{
-            {left, top, right, t}, {left, b, right, bottom}, {left, t, l, b}, {r, t, right, b},
-        }};
-        const std::array<RECT, 4> vertical{{
-            {left, top, l, bottom}, {r, top, right, bottom}, {l, top, r, t}, {l, b, r, bottom},
-        }};
-        std::vector<RECT> alternative;
-        for (const auto& area : horizontal) AddSlots(area, center, slot, gap, slots);
-        for (const auto& area : vertical) AddSlots(area, center, slot, gap, alternative);
-        if (alternative.size() > slots.size()) slots.swap(alternative);
-    }
-
-    const auto distance = [&](const RECT& rect) {
-        const double dx = static_cast<double>(rect.left) + slot.cx / 2.0 - center.x;
-        const double dy = static_cast<double>(rect.top) + slot.cy / 2.0 - center.y;
-        return dx * dx + dy * dy;
-    };
-    std::stable_sort(slots.begin(), slots.end(), [&](const RECT& first, const RECT& second) {
-        return distance(first) < distance(second);
-    });
+    std::shuffle(slots.begin(), slots.end(), random);
     return slots;
 }
 
@@ -82,7 +43,6 @@ std::vector<RECT> CaptionSlots(const RECT& workArea, const RECT& anchor, SIZE sl
 #include <iterator>
 #include <map>
 #include <memory>
-#include <random>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -106,7 +66,6 @@ constexpr UINT kChangePage = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
 constexpr DWORD kTileStyle = WS_POPUP | WS_CAPTION;
 constexpr DWORD kTileExStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
-constexpr wchar_t kRefreshLabel[] = L"↺";
 using tagsearch::TagOperator;
 
 struct TagMode {
@@ -146,6 +105,8 @@ struct Caption {
     HWND controller = nullptr;
     std::map<UINT, HFONT> tagFonts;
     std::vector<std::unique_ptr<FloatingTag>> tags;
+    std::vector<RECT> slots;
+    std::mt19937 random{std::random_device{}()};
     tagsearch::Folders folders;
     std::size_t page = 0;
     std::size_t pageCount = 1;
@@ -178,24 +139,6 @@ int TileHeight(UINT dpi) {
     RECT frame{0, 0, 0, Scale(30, dpi)};
     AdjustWindowRectExForDpi(&frame, kTileStyle, FALSE, kTileExStyle, dpi);
     return frame.bottom - frame.top;
-}
-
-RECT RefreshBounds(const RECT& work, UINT dpi, const RECT* previous = nullptr) {
-    const LONG width = std::min<LONG>(Scale(58, dpi), work.right - work.left);
-    const LONG height = std::min<LONG>(TileHeight(dpi), work.bottom - work.top);
-    const LONG maxX = work.right - width;
-    const LONG maxY = work.bottom - height;
-    LONG x;
-    LONG y;
-    if (previous) {
-        x = std::clamp(previous->left, work.left, maxX);
-        y = std::clamp(previous->top, work.top, maxY);
-    } else {
-        std::random_device random;
-        x = std::uniform_int_distribution<LONG>(work.left, maxX)(random);
-        y = std::uniform_int_distribution<LONG>(work.top, maxY)(random);
-    }
-    return {x, y, x + width, y + height};
 }
 
 HFONT MakeFont(int pixels, int weight, const wchar_t* family) {
@@ -233,30 +176,22 @@ double Luminance(COLORREF color) {
            0.0722 * linear(GetBValue(color));
 }
 
-COLORREF AccentColor() {
-    DWORD color = 0;
-    BOOL opaque = FALSE;
-    return SUCCEEDED(DwmGetColorizationColor(&color, &opaque))
-        ? RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
-        : GetSysColor(COLOR_ACTIVECAPTION);
-}
-
 COLORREF TagColor(TagOperator operation) {
     return kTagModes[static_cast<std::size_t>(operation)].color;
 }
 
-Palette TilePalette(COLORREF background, BYTE opacity = 225) {
+Palette TilePalette(COLORREF background) {
     HIGHCONTRASTW highContrast{sizeof(highContrast)};
     if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(highContrast), &highContrast, 0) &&
         (highContrast.dwFlags & HCF_HIGHCONTRASTON)) {
         return {GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT), 255};
     }
     const COLORREF text = Luminance(background) >= 0.179 ? RGB(0, 0, 0) : RGB(255, 255, 255);
-    return {background, text, opacity};
+    return {background, text, 225};
 }
 
-void ApplyPalette(HWND window, COLORREF color, BYTE opacity = 225) {
-    const auto palette = TilePalette(color, opacity);
+void ApplyPalette(HWND window, COLORREF color) {
+    const auto palette = TilePalette(color);
     SetLayeredWindowAttributes(window, 0, palette.opacity, LWA_ALPHA);
     DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &palette.background, sizeof(COLORREF));
     DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &palette.text, sizeof(COLORREF));
@@ -444,15 +379,20 @@ std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& tex
     return tag->window ? std::move(tag) : nullptr;
 }
 
+void BuildTagLayout(Caption& caption) {
+    const RECT work = PrimaryWorkArea();
+    SetWindowPos(caption.controller, nullptr, work.left, work.top, 0, 0,
+                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE);
+    const UINT dpi = WindowDpi(caption.controller);
+    const LONG width = std::min<LONG>(Scale(230, dpi), work.right - work.left);
+    const LONG height = std::min<LONG>(TileHeight(dpi), work.bottom - work.top);
+    caption.slots = tagsearch::CaptionSlots(work, {width, height}, Scale(8, dpi), caption.random);
+    for (const auto& tag : caption.tags) tag->positioned = false;
+}
+
 void LayoutTags(Caption& caption) {
     const UINT dpi = WindowDpi(caption.controller);
-    const RECT work = PrimaryWorkArea();
-    RECT anchor{};
-    if (!GetWindowRect(caption.controller, &anchor)) return;
-    const int gap = Scale(8, dpi);
-    const LONG cellWidth = std::min<LONG>(Scale(230, dpi), work.right - work.left);
-    const auto slots = tagsearch::CaptionSlots(work, anchor, {cellWidth, TileHeight(dpi)}, gap);
-    const auto capacity = slots.size();
+    const auto capacity = caption.slots.size();
     caption.pageCount = capacity && !caption.tags.empty() ? 1 + (caption.tags.size() - 1) / capacity : 1;
     caption.page = std::min(caption.page, caption.pageCount - 1);
     const std::size_t first = caption.page * capacity;
@@ -468,7 +408,7 @@ void LayoutTags(Caption& caption) {
         }
 
         if (!tag.positioned) {
-            const RECT& slot = slots[i - first];
+            const RECT& slot = caption.slots[i - first];
             SIZE text{};
             if (dc) GetTextExtentPoint32W(dc, tag.text.c_str(), static_cast<int>(tag.text.size()), &text);
             const int width = std::min(static_cast<int>(slot.right - slot.left),
@@ -486,16 +426,7 @@ void LayoutTags(Caption& caption) {
     }
 }
 
-void RelayoutTags(Caption& caption) {
-    for (const auto& tag : caption.tags) tag->positioned = false;
-    LayoutTags(caption);
-}
-
 void ActivateTags(Caption& caption) {
-    if (IsIconic(caption.controller)) ShowWindow(caption.controller, SW_RESTORE);
-    ShowWindow(caption.controller, SW_SHOWNA);
-    SetWindowPos(caption.controller, HWND_TOP, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     LayoutTags(caption);
     // Preserve the stacking order of overlapping tags when bringing the page forward.
     std::vector<HWND> windows;
@@ -509,7 +440,7 @@ void ActivateTags(Caption& caption) {
         SetWindowPos(*i, HWND_TOP, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
-    SetForegroundWindow(windows.empty() ? caption.controller : windows.front());
+    if (!windows.empty()) SetForegroundWindow(windows.front());
 }
 
 void ScanInBackground(Caption& caption, std::stop_token stop) {
@@ -542,14 +473,23 @@ bool StartStartupScan(Caption& caption) {
 void ShowScanResult(Caption& caption) {
     if (!caption.scanner.joinable()) return;
     caption.scanner.join();
-    if (!caption.scan.success) return;
+    if (!caption.scan.success) {
+        PostQuitMessage(1);
+        return;
+    }
 
     caption.folders = std::move(caption.scan.folders);
     const RECT work = PrimaryWorkArea();
     for (const auto& text : caption.scan.tags) {
         if (auto tag = CreateTag(caption, text, work)) caption.tags.push_back(std::move(tag));
     }
+    const bool scanWasEmpty = caption.scan.tags.empty();
     caption.scan = {};
+    if (caption.tags.empty()) {
+        PostQuitMessage(scanWasEmpty ? 0 : 1);
+        return;
+    }
+    BuildTagLayout(caption);
     ActivateTags(caption);
 }
 
@@ -562,42 +502,6 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     if (!caption) return DefWindowProcW(window, message, wParam, lParam);
 
     switch (message) {
-    case WM_CREATE:
-    case WM_DWMCOLORIZATIONCOLORCHANGED:
-    case WM_SYSCOLORCHANGE:
-    case WM_THEMECHANGED:
-        ApplyPalette(window, AccentColor(), 255);
-        return 0;
-    case WM_PAINT:
-        PaintTile(window, *caption, kRefreshLabel, AccentColor());
-        return 0;
-    case WM_NCHITTEST: {
-        const auto hit = DefWindowProcW(window, message, wParam, lParam);
-        return hit == HTCAPTION ? HTCLIENT : hit;
-    }
-    case WM_LBUTTONUP:
-        RelayoutTags(*caption);
-        return 0;
-    case WM_NCRBUTTONUP:
-    case WM_CONTEXTMENU:
-        return 0;
-    case WM_MOUSEWHEEL:
-        ChangePage(window, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? VK_PRIOR : VK_NEXT);
-        return 0;
-    case WM_KEYDOWN:
-        if (wParam == VK_RETURN || wParam == VK_SPACE) {
-            if ((HIWORD(lParam) & KF_REPEAT) == 0) RelayoutTags(*caption);
-            return 0;
-        }
-        if (wParam == VK_PRIOR || wParam == VK_NEXT) {
-            ChangePage(window, wParam);
-            return 0;
-        }
-        if (wParam == VK_ESCAPE) {
-            PostQuitMessage(0);
-            return 0;
-        }
-        break;
     case kScanComplete:
         ShowScanResult(*caption);
         return 0;
@@ -605,26 +509,18 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
         ActivateTags(*caption);
         return 0;
     case WM_SETTINGCHANGE:
-        if (wParam != SPI_SETWORKAREA) {
-            ApplyPalette(window, AccentColor(), 255);
-            return 0;
-        }
+        if (wParam != SPI_SETWORKAREA) break;
         [[fallthrough]];
     case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
         PostMessageW(window, kReflow, 0, 0);
         return 0;
-    case kReflow: {
-        RECT previous{};
-        const RECT work = PrimaryWorkArea();
-        if (GetWindowRect(window, &previous) && !IsRectEmpty(&work)) {
-            const auto bounds = RefreshBounds(work, WindowDpi(window), &previous);
-            SetWindowPos(window, nullptr, bounds.left, bounds.top, bounds.right - bounds.left,
-                         bounds.bottom - bounds.top, SWP_NOACTIVATE | SWP_NOZORDER);
-            RelayoutTags(*caption);
+    case kReflow:
+        if (!caption->tags.empty()) {
+            BuildTagLayout(*caption);
+            LayoutTags(*caption);
         }
         return 0;
-    }
     case kChangePage:
         if (wParam == VK_PRIOR && caption->page > 0) {
             --caption->page;
@@ -649,7 +545,6 @@ int Run(HINSTANCE instance) {
     controllerClass.hInstance = instance;
     controllerClass.lpfnWndProc = ControllerProc;
     controllerClass.lpszClassName = kControllerClass;
-    controllerClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
     if (!RegisterClassW(&controllerClass)) return 1;
 
     WNDCLASSW tagClass{};
@@ -661,15 +556,10 @@ int Run(HINSTANCE instance) {
 
     const RECT work = PrimaryWorkArea();
     if (IsRectEmpty(&work)) return 1;
-    const auto bounds = RefreshBounds(work, GetDpiForSystem());
-    caption.controller = CreateWindowExW(kTileExStyle, kControllerClass, kRefreshLabel,
-        kTileStyle, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+    caption.controller = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kControllerClass, nullptr, WS_POPUP, work.left, work.top, 1, 1,
         nullptr, nullptr, instance, &caption);
-    if (!caption.controller) return 1;
-
-    ShowWindow(caption.controller, SW_SHOWNORMAL);
-    UpdateWindow(caption.controller);
-    if (!StartStartupScan(caption)) return 1;
+    if (!caption.controller || !StartStartupScan(caption)) return 1;
 
     MSG message{};
     BOOL result;

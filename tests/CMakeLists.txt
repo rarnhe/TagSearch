@@ -29,6 +29,7 @@ set(cases
     create_search_folder_accepts_combined_tags
     caption_slots_keep_windows_in_bounds
     caption_slots_handle_tight_fit
+    caption_slots_shuffle_assignments
     mixed_tag_query_matches_windows_search_order
 )
 
@@ -46,9 +47,9 @@ add_test(NAME treeview_single_instance_startup
          COMMAND tagsearch_window_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
 add_test(NAME treeview_fixed_window_and_folder_title
          COMMAND tagsearch_window_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
-add_test(NAME caption_refresh_anchor_and_tag_windows
+add_test(NAME caption_background_scan_and_random_tag_windows
          COMMAND tagsearch_window_startup_test caption $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
-                     caption_refresh_anchor_and_tag_windows
+                     caption_background_scan_and_random_tag_windows
                      PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)

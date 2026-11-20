@@ -89,14 +89,14 @@ struct Process {
     }
 };
 
-HWND WaitForPanel(const Process& process, const wchar_t* className = L"TagSearchTreeView") {
+HWND WaitForPanel(const Process& process, const wchar_t* className = L"TagSearchTreeView", bool visible = true) {
     HWND window = nullptr;
     Expect(WaitUntil([&] {
         window = FindWindowW(className, nullptr);
         DWORD processId = 0;
         return window && GetWindowThreadProcessId(window, &processId) &&
-               processId == process.info.dwProcessId && IsWindowVisible(window);
-    }), "the launch should show its own panel");
+               processId == process.info.dwProcessId && (IsWindowVisible(window) != FALSE) == visible;
+    }), "the launch should create its own window with the expected visibility");
     return window;
 }
 
@@ -194,7 +194,8 @@ void CheckFixedWindowAndTitle(const fs::path& executable) {
 }
 
 struct VisibleTags {
-    HWND anchor;
+    HWND controller;
+    bool unexpectedVisibleWindow = false;
     std::vector<HWND> windows;
     std::vector<RECT> bounds;
     tagsearch::Tags titles;
@@ -202,9 +203,15 @@ struct VisibleTags {
 
 BOOL CALLBACK RecordVisibleTags(HWND window, LPARAM parameter) {
     auto& tags = *reinterpret_cast<VisibleTags*>(parameter);
+    if (!IsWindowVisible(window)) return TRUE;
+    std::array<wchar_t, 128> className{};
+    GetClassNameW(window, className.data(), static_cast<int>(className.size()));
+    if (GetWindow(window, GW_OWNER) != tags.controller || std::wstring_view(className.data()) != L"TagSearchFloatingTag") {
+        tags.unexpectedVisibleWindow = true;
+        return TRUE;
+    }
     RECT rect{};
-    if (IsWindowVisible(window) && GetWindow(window, GW_OWNER) == tags.anchor &&
-        GetWindowRect(window, &rect)) {
+    if (GetWindowRect(window, &rect)) {
         std::array<wchar_t, 128> title{};
         GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
         tags.windows.push_back(window);
@@ -220,18 +227,18 @@ bool Within(const RECT& rect, const RECT& area) {
 }
 
 void RecordCaptionPage(DWORD threadId, VisibleTags& tags) {
+    tags.unexpectedVisibleWindow = false;
     tags.windows.clear();
     tags.bounds.clear();
     tags.titles.clear();
     EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
 }
 
-void CheckTagBounds(const VisibleTags& tags, const RECT& work, const RECT& anchor) {
+void CheckTagBounds(const VisibleTags& tags, const RECT& work) {
     for (std::size_t i = 0; i < tags.bounds.size(); ++i) {
         const auto& rect = tags.bounds[i];
         RECT overlap{};
         Expect(Within(rect, work), "the tag window must stay inside the primary work area");
-        Expect(!IntersectRect(&overlap, &rect, &anchor), "the tag must not cover the refresh window");
         for (std::size_t j = 0; j < i; ++j) {
             Expect(!IntersectRect(&overlap, &rect, &tags.bounds[j]), "the laid-out tag windows must not overlap");
         }
@@ -240,69 +247,38 @@ void CheckTagBounds(const VisibleTags& tags, const RECT& work, const RECT& ancho
 
 void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     const TestCopy copy(executable);
-    const auto copiedFixture = copy.directory / L"tagged.jpg";
-    fs::copy_file(fixture, copiedFixture);
+    fs::copy_file(fixture, copy.directory / L"tagged.jpg");
     const Process first(copy.executable, {copy.directory});
-    const HWND anchor = WaitForPanel(first, L"TagSearchCaptionController");
-    WaitForTitle(anchor, L"↺");
-    Expect(GetWindow(anchor, GW_OWNER) == nullptr,
-           "the refresh window should be the visible root without a hidden owner");
-    RECT anchorBounds{};
+    const HWND controller = WaitForPanel(first, L"TagSearchCaptionController", false);
     MONITORINFO monitor{sizeof(monitor)};
     const POINT origin{};
-    Expect(GetWindowRect(anchor, &anchorBounds) &&
-           GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor) &&
-           Within(anchorBounds, monitor.rcWork),
-           "the visible refresh window should start entirely inside the primary work area");
+    Expect(GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor),
+           "the test should read the primary work area");
 
-    DWORD_PTR result = 0;
-    Expect(SendMessageTimeoutW(anchor, WM_CONTEXTMENU, 0, -1, SMTO_ABORTIFHUNG,
-                               1000, &result) && result == 0,
-           "the refresh window should dismiss the context-menu message without opening a menu");
-
-    VisibleTags tags{anchor};
-    const DWORD threadId = GetWindowThreadProcessId(anchor, nullptr);
+    VisibleTags tags{controller};
+    const DWORD threadId = GetWindowThreadProcessId(controller, nullptr);
     Expect(WaitUntil([&] {
         RecordCaptionPage(threadId, tags);
         return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
                std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
-    }), "the background scan should show both real labels read from the JPEG fixture");
-
-    CheckTagBounds(tags, monitor.rcWork, anchorBounds);
+    }), "the background scan should show both labels from the JPEG fixture");
+    Expect(!tags.unexpectedVisibleWindow, "only real tag windows should be visible after the scan");
+    CheckTagBounds(tags, monitor.rcWork);
 
     const auto originalWindows = tags.windows;
-    const auto& work = monitor.rcWork;
-    const LONG anchorWidth = anchorBounds.right - anchorBounds.left;
-    const LONG anchorHeight = anchorBounds.bottom - anchorBounds.top;
-    const LONG middle = work.left + (work.right - work.left) / 2;
-    const LONG x = anchorBounds.left < middle ? work.right - anchorWidth : work.left;
-    const LONG y = work.bottom - anchorHeight;
-    constexpr UINT moveFlags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
-    Expect(SetWindowPos(anchor, nullptr, x, y, 0, 0, moveFlags) &&
-           GetWindowRect(anchor, &anchorBounds),
-           "the test should move the refresh window to another corner");
-
     const HWND tag = originalWindows.front();
-    RECT tagBounds{};
-    RECT overlap{};
-    Expect(SetWindowPos(tag, nullptr, anchorBounds.left, anchorBounds.top, 0, 0, moveFlags) &&
-           GetWindowRect(tag, &tagBounds) && IntersectRect(&overlap, &tagBounds, &anchorBounds),
-           "the test should put an existing tag on top of the moved refresh window");
-
-    Expect(fs::remove(copiedFixture), "the test should remove the scanned file before using refresh");
-    Expect(SendMessageTimeoutW(anchor, WM_LBUTTONUP, 0, 0, SMTO_ABORTIFHUNG, 1000, &result),
-           "clicking the refresh window should arrange the current windows immediately");
-    RecordCaptionPage(threadId, tags);
-    Expect(tags.windows.size() == originalWindows.size() &&
-           std::is_permutation(originalWindows.begin(), originalWindows.end(), tags.windows.begin()),
-           "clicking refresh should keep the existing tag windows even after removing the scanned file");
-    CheckTagBounds(tags, work, anchorBounds);
-
+    Expect(ShowWindowAsync(tag, SW_HIDE) && WaitUntil([&] { return !IsWindowVisible(tag); }),
+           "the test should hide a tag before starting Caption again");
     const Process second(copy.executable);
     second.ExpectSuccessfulExit("Caption's duplicate launch should forward activation and exit");
-    Expect(FindWindowW(L"TagSearchCaptionController", L"↺") == anchor,
-           "the original refresh window should survive a repeated launch");
-    ClosePanel(anchor, first);
+    Expect(WaitUntil([&] { return IsWindowVisible(tag); }),
+           "the duplicate launch should restore the existing tag window");
+    RecordCaptionPage(threadId, tags);
+    Expect(!tags.unexpectedVisibleWindow &&
+           std::is_permutation(originalWindows.begin(), originalWindows.end(), tags.windows.begin(), tags.windows.end()),
+           "activation should restore the original tags and keep the controller hidden");
+    CheckTagBounds(tags, monitor.rcWork);
+    ClosePanel(controller, first);
 }
 
 } // namespace
