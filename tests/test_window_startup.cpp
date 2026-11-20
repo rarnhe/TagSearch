@@ -195,6 +195,7 @@ void CheckFixedWindowAndTitle(const fs::path& executable) {
 
 struct VisibleTags {
     HWND anchor;
+    std::vector<HWND> windows;
     std::vector<RECT> bounds;
     tagsearch::Tags titles;
 };
@@ -206,6 +207,7 @@ BOOL CALLBACK RecordVisibleTags(HWND window, LPARAM parameter) {
         GetWindowRect(window, &rect)) {
         std::array<wchar_t, 128> title{};
         GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+        tags.windows.push_back(window);
         tags.bounds.push_back(rect);
         tags.titles.emplace_back(title.data());
     }
@@ -217,9 +219,29 @@ bool Within(const RECT& rect, const RECT& area) {
            rect.right <= area.right && rect.bottom <= area.bottom;
 }
 
+void RecordCaptionPage(DWORD threadId, VisibleTags& tags) {
+    tags.windows.clear();
+    tags.bounds.clear();
+    tags.titles.clear();
+    EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
+}
+
+void CheckTagBounds(const VisibleTags& tags, const RECT& work, const RECT& anchor) {
+    for (std::size_t i = 0; i < tags.bounds.size(); ++i) {
+        const auto& rect = tags.bounds[i];
+        RECT overlap{};
+        Expect(Within(rect, work), "the tag window must stay inside the primary work area");
+        Expect(!IntersectRect(&overlap, &rect, &anchor), "the tag must not cover the refresh window");
+        for (std::size_t j = 0; j < i; ++j) {
+            Expect(!IntersectRect(&overlap, &rect, &tags.bounds[j]), "the laid-out tag windows must not overlap");
+        }
+    }
+}
+
 void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     const TestCopy copy(executable);
-    fs::copy_file(fixture, copy.directory / L"tagged.jpg");
+    const auto copiedFixture = copy.directory / L"tagged.jpg";
+    fs::copy_file(fixture, copiedFixture);
     const Process first(copy.executable, {copy.directory});
     const HWND anchor = WaitForPanel(first, L"TagSearchCaptionController");
     WaitForTitle(anchor, L"↺");
@@ -241,22 +263,40 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     VisibleTags tags{anchor};
     const DWORD threadId = GetWindowThreadProcessId(anchor, nullptr);
     Expect(WaitUntil([&] {
-        tags.bounds.clear();
-        tags.titles.clear();
-        EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
+        RecordCaptionPage(threadId, tags);
         return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
                std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
     }), "the background scan should show both real labels read from the JPEG fixture");
 
-    for (std::size_t i = 0; i < tags.bounds.size(); ++i) {
-        const auto& rect = tags.bounds[i];
-        RECT overlap{};
-        Expect(Within(rect, monitor.rcWork), "the tag window must stay inside the primary work area");
-        Expect(!IntersectRect(&overlap, &rect, &anchorBounds), "the tag must not cover the refresh window");
-        for (std::size_t j = 0; j < i; ++j) {
-            Expect(!IntersectRect(&overlap, &rect, &tags.bounds[j]), "the initially placed tag windows must not overlap");
-        }
-    }
+    CheckTagBounds(tags, monitor.rcWork, anchorBounds);
+
+    const auto originalWindows = tags.windows;
+    const auto& work = monitor.rcWork;
+    const LONG anchorWidth = anchorBounds.right - anchorBounds.left;
+    const LONG anchorHeight = anchorBounds.bottom - anchorBounds.top;
+    const LONG middle = work.left + (work.right - work.left) / 2;
+    const LONG x = anchorBounds.left < middle ? work.right - anchorWidth : work.left;
+    const LONG y = work.bottom - anchorHeight;
+    constexpr UINT moveFlags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
+    Expect(SetWindowPos(anchor, nullptr, x, y, 0, 0, moveFlags) &&
+           GetWindowRect(anchor, &anchorBounds),
+           "the test should move the refresh window to another corner");
+
+    const HWND tag = originalWindows.front();
+    RECT tagBounds{};
+    RECT overlap{};
+    Expect(SetWindowPos(tag, nullptr, anchorBounds.left, anchorBounds.top, 0, 0, moveFlags) &&
+           GetWindowRect(tag, &tagBounds) && IntersectRect(&overlap, &tagBounds, &anchorBounds),
+           "the test should put an existing tag on top of the moved refresh window");
+
+    Expect(fs::remove(copiedFixture), "the test should remove the scanned file before using refresh");
+    Expect(SendMessageTimeoutW(anchor, WM_LBUTTONUP, 0, 0, SMTO_ABORTIFHUNG, 1000, &result),
+           "clicking the refresh window should arrange the current windows immediately");
+    RecordCaptionPage(threadId, tags);
+    Expect(tags.windows.size() == originalWindows.size() &&
+           std::is_permutation(originalWindows.begin(), originalWindows.end(), tags.windows.begin()),
+           "clicking refresh should keep the existing tag windows even after removing the scanned file");
+    CheckTagBounds(tags, work, anchorBounds);
 
     const Process second(copy.executable);
     second.ExpectSuccessfulExit("Caption's duplicate launch should forward activation and exit");

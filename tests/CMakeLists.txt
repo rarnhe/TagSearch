@@ -2,9 +2,13 @@ if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "TagSearch tests require Windows, MSVC and the Windows SDK")
 endif()
 
-add_executable(tagsearch_tests test_tagsearch.cpp)
+# Compile the production layout directly, without the Win32 app entry point.
+add_executable(tagsearch_tests test_tagsearch.cpp ../TagSearch_Caption.cpp TagSearch_Layout.h)
 target_link_libraries(tagsearch_tests PRIVATE TagSearchCore)
-target_compile_definitions(tagsearch_tests PRIVATE TAGSEARCH_FIXTURE=L"${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
+target_compile_definitions(tagsearch_tests PRIVATE
+    TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
+    TAGSEARCH_FIXTURE=L"${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg"
+)
 target_compile_options(tagsearch_tests PRIVATE /utf-8)
 
 set(cases
