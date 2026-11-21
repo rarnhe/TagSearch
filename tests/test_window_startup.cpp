@@ -1,11 +1,15 @@
 #include "TagSearch_Core.h"
 
+#include <propkey.h>
+#include <propvarutil.h>
 #include <shlobj.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -212,11 +216,12 @@ BOOL CALLBACK RecordVisibleTags(HWND window, LPARAM parameter) {
     }
     RECT rect{};
     if (GetWindowRect(window, &rect)) {
-        std::array<wchar_t, 128> title{};
-        GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+        std::wstring title(static_cast<std::size_t>(GetWindowTextLengthW(window)) + 1, L'\0');
+        const int length = GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+        title.resize(static_cast<std::size_t>(length));
         tags.windows.push_back(window);
         tags.bounds.push_back(rect);
-        tags.titles.emplace_back(title.data());
+        tags.titles.push_back(std::move(title));
     }
     return TRUE;
 }
@@ -226,7 +231,7 @@ bool Within(const RECT& rect, const RECT& area) {
            rect.right <= area.right && rect.bottom <= area.bottom;
 }
 
-void RecordCaptionPage(DWORD threadId, VisibleTags& tags) {
+void ReadVisibleCaptionTags(DWORD threadId, VisibleTags& tags) {
     tags.unexpectedVisibleWindow = false;
     tags.windows.clear();
     tags.bounds.clear();
@@ -234,15 +239,44 @@ void RecordCaptionPage(DWORD threadId, VisibleTags& tags) {
     EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
 }
 
+void CheckNativeCaption(HWND window, const RECT& bounds) {
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+    constexpr DWORD nativeStyle = WS_POPUP | WS_CAPTION;
+    constexpr DWORD extraStyles = WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CHILD;
+    Expect((style & (nativeStyle | extraStyles)) == nativeStyle,
+           "a tag should use only the native popup caption style");
+    const auto extended = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+    Expect((extended & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) == WS_EX_TOOLWINDOW,
+           "a tag should be a native tool window without a layered surface");
+    RECT client{};
+    POINT clientOrigin{};
+    Expect(GetClientRect(window, &client) && client.bottom == client.top &&
+           ClientToScreen(window, &clientOrigin) && clientOrigin.y > bounds.top,
+           "the native title bar should be visible with zero client-area height");
+    const auto captionPoint = MAKELPARAM(bounds.left + (bounds.right - bounds.left) / 2,
+                                         bounds.top + (clientOrigin.y - bounds.top) / 2);
+    DWORD_PTR hit = 0;
+    Expect(SendMessageTimeoutW(window, WM_NCHITTEST, 0, captionPoint, SMTO_ABORTIFHUNG, 1000, &hit) &&
+           hit == HTCAPTION, "Windows should hit-test the tag as a native title bar");
+}
+
 void CheckTagBounds(const VisibleTags& tags, const RECT& work) {
     for (std::size_t i = 0; i < tags.bounds.size(); ++i) {
         const auto& rect = tags.bounds[i];
-        RECT overlap{};
-        Expect(Within(rect, work), "the tag window must stay inside the primary work area");
+        Expect(!IsRectEmpty(&rect) && Within(rect, work),
+               "the tag window must stay inside the primary work area");
+        CheckNativeCaption(tags.windows[i], rect);
+    }
+}
+
+bool HasIntersection(const std::vector<RECT>& bounds) {
+    for (std::size_t i = 0; i < bounds.size(); ++i) {
         for (std::size_t j = 0; j < i; ++j) {
-            Expect(!IntersectRect(&overlap, &rect, &tags.bounds[j]), "the laid-out tag windows must not overlap");
+            RECT intersection{};
+            if (IntersectRect(&intersection, &bounds[i], &bounds[j])) return true;
         }
     }
+    return false;
 }
 
 void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
@@ -258,12 +292,14 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     VisibleTags tags{controller};
     const DWORD threadId = GetWindowThreadProcessId(controller, nullptr);
     Expect(WaitUntil([&] {
-        RecordCaptionPage(threadId, tags);
+        ReadVisibleCaptionTags(threadId, tags);
         return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
                std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
     }), "the background scan should show both labels from the JPEG fixture");
-    Expect(!tags.unexpectedVisibleWindow, "only real tag windows should be visible after the scan");
+    Expect(!tags.unexpectedVisibleWindow && !IsWindowVisible(controller),
+           "only real tag windows should be visible after the scan");
     CheckTagBounds(tags, monitor.rcWork);
+    Expect(!HasIntersection(tags.bounds), "two short tags should fit without overlap");
 
     const auto originalWindows = tags.windows;
     const HWND tag = originalWindows.front();
@@ -273,12 +309,75 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     second.ExpectSuccessfulExit("Caption's duplicate launch should forward activation and exit");
     Expect(WaitUntil([&] { return IsWindowVisible(tag); }),
            "the duplicate launch should restore the existing tag window");
-    RecordCaptionPage(threadId, tags);
+    ReadVisibleCaptionTags(threadId, tags);
     Expect(!tags.unexpectedVisibleWindow &&
            std::is_permutation(originalWindows.begin(), originalWindows.end(), tags.windows.begin(), tags.windows.end()),
            "activation should restore the original tags and keep the controller hidden");
     CheckTagBounds(tags, monitor.rcWork);
     ClosePanel(controller, first);
+}
+
+void WriteTagFixture(const fs::path& source, const fs::path& target, const tagsearch::Tags& titles) {
+    fs::copy_file(source, target);
+    Microsoft::WRL::ComPtr<IPropertyStore> store;
+    Expect(SUCCEEDED(SHGetPropertyStoreFromParsingName(target.c_str(), nullptr, GPS_READWRITE,
+                                                       IID_PPV_ARGS(store.GetAddressOf()))),
+           "the crowded JPEG fixture should support writing keywords");
+    std::vector<PCWSTR> names;
+    for (const auto& title : titles) names.push_back(title.c_str());
+    PROPVARIANT value{};
+    const auto initialized = InitPropVariantFromStringVector(names.data(), static_cast<ULONG>(names.size()), &value);
+    const auto written = SUCCEEDED(initialized) ? store->SetValue(PKEY_Keywords, value) : initialized;
+    PropVariantClear(&value);
+    Expect(SUCCEEDED(written) && SUCCEEDED(store->Commit()), "the crowded JPEG fixture should persist its tags");
+}
+
+void CheckCrowdedCaption(const fs::path& executable, const fs::path& fixture) {
+    const TestCopy copy(executable);
+    MONITORINFO monitor{sizeof(monitor)};
+    const POINT origin{};
+    Expect(GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor),
+           "the test should read the primary work area");
+    const UINT dpi = GetDpiForSystem();
+    RECT frame{};
+    Expect(AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION, FALSE, WS_EX_TOOLWINDOW, dpi) &&
+           frame.bottom > frame.top, "the test should read the native caption height");
+    const auto& work = monitor.rcWork;
+    const LONG rows = (work.bottom - work.top) / (frame.bottom - frame.top);
+    const LONG titleWidth = MulDiv(600, dpi, USER_DEFAULT_SCREEN_DPI);
+    const LONG count = rows * (1 + (work.right - work.left) / titleWidth) + 8;
+    constexpr std::wstring_view prefix = L"Crowded test tag ";
+
+    Expect(SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)), "the fixture writer requires COM");
+    try {
+        constexpr LONG tagsPerImage = 8;
+        for (LONG start = 0; start < count; start += tagsPerImage) {
+            tagsearch::Tags titles;
+            for (LONG i = start; i < std::min(count, start + tagsPerImage); ++i) {
+                titles.push_back(std::wstring(prefix) + std::to_wstring(i) + L" " + std::wstring(120, L'M'));
+            }
+            WriteTagFixture(fixture, copy.directory / (std::to_wstring(start) + L".jpg"), titles);
+        }
+    } catch (...) {
+        CoUninitialize();
+        throw;
+    }
+    CoUninitialize();
+
+    const Process process(copy.executable, {copy.directory});
+    const HWND controller = WaitForPanel(process, L"TagSearchCaptionController", false);
+    const DWORD threadId = GetWindowThreadProcessId(controller, nullptr);
+    VisibleTags tags{controller};
+    Expect(WaitUntil([&] {
+        ReadVisibleCaptionTags(threadId, tags);
+        return std::count_if(tags.titles.begin(), tags.titles.end(),
+                             [&](const std::wstring& title) { return title.starts_with(prefix); }) == count;
+    }), "all crowded tags should be visible at the same time");
+    Expect(!tags.unexpectedVisibleWindow && !IsWindowVisible(controller),
+           "a crowded scan should still show only real tag windows");
+    CheckTagBounds(tags, work);
+    Expect(HasIntersection(tags.bounds), "overflow tags should overlap within the work area");
+    ClosePanel(controller, process);
 }
 
 } // namespace
@@ -294,6 +393,8 @@ int wmain(int argc, wchar_t** argv) {
             CheckFixedWindowAndTitle(argv[2]);
         } else if (mode == L"caption" && argc == 4) {
             CheckCaptionLayout(argv[2], argv[3]);
+        } else if (mode == L"caption-crowded" && argc == 4) {
+            CheckCrowdedCaption(argv[2], argv[3]);
         } else {
             return 2;
         }
