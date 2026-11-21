@@ -271,49 +271,71 @@ void SearchConditionCombinesAllTagsWithAnd() {
     ExpectEqual(actual, expected, "the AND node should hold each tag as a literal keyword");
 }
 
-void CaptionSlotsKeepWindowsInBounds() {
-    const std::array<RECT, 3> workAreas{{
-        {-900, -18, 0, 560}, {0, 40, 1080, 580}, {300, 0, 730, 1200},
-    }};
-    std::mt19937 random{1729};
-    for (const auto& work : workAreas) {
-        const auto slots = tagsearch::CaptionSlots(work, {160, 46}, 8, random);
-        Expect(!slots.empty(), "each work area should have room for tag windows");
-        for (std::size_t i = 0; i < slots.size(); ++i) {
-            const auto& rect = slots[i];
-            Expect(rect.left >= work.left && rect.top >= work.top && rect.right <= work.right &&
-                   rect.bottom <= work.bottom, "a tag must stay entirely in the work area");
+std::size_t CountCaptionIntersections(std::span<const RECT> windows, const RECT& work) {
+    std::size_t count = 0;
+    for (const auto& window : windows) {
+        Expect(!IsRectEmpty(&window) && window.left >= work.left && window.top >= work.top &&
+               window.right <= work.right && window.bottom <= work.bottom,
+               "each tag must fit entirely within the work area");
+        for (const auto& other : windows) {
             RECT overlap{};
-            for (std::size_t j = 0; j < i; ++j) {
-                Expect(!IntersectRect(&overlap, &rect, &slots[j]), "new tag windows must be disjoint");
+            if (&other != &window && IntersectRect(&overlap, &window, &other)) {
+                ++count;
+                break;
             }
         }
     }
+    return count;
 }
 
-void CaptionSlotsHandleTightFit() {
-    const RECT work{0, 0, 210, 120};
+void CaptionLayoutPacksVariableWidths() {
+    const RECT work{-200, 30, 0, 80};
+    const std::array<LONG, 6> widths{120, 120, 50, 50, 30, 30};
+    std::array<RECT, widths.size()> bounds{};
     std::mt19937 random{1729};
-    const auto slots = tagsearch::CaptionSlots(work, {160, 38}, 6, random);
-    ExpectEqual(slots.size(), std::size_t{2}, "two tag slots should fit in a tall, narrow work area");
-    Expect(tagsearch::CaptionSlots(work, {211, 38}, 6, random).empty(),
-           "oversized slots must not escape the desktop");
+    const auto count = tagsearch::LayoutCaptionWindows(work, widths, 25, bounds, random);
+    ExpectEqual(count, std::size_t{0}, "two rows should exactly fit the six native caption widths");
+    ExpectEqual(CountCaptionIntersections(bounds, work), count, "touching edges must not register as overlap");
+    for (std::size_t i = 0; i < widths.size(); ++i) {
+        ExpectEqual(bounds[i].right - bounds[i].left, widths[i], "each tag keeps its measured width");
+    }
 }
 
-void CaptionSlotsShuffleAssignments() {
+void CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap() {
+    const RECT work{-100, 30, 0, 50};
+    const std::array<LONG, 6> widths{280, 230, 160, 60, 30, 120};
+    std::array<RECT, widths.size()> bounds{};
+    for (unsigned seed = 0; seed < 32; ++seed) {
+        std::mt19937 random{seed};
+        const auto count = tagsearch::LayoutCaptionWindows(work, widths, 40, bounds, random);
+        ExpectEqual(count, widths.size(), "all tag windows intersect at least one other and should count once");
+        ExpectEqual(CountCaptionIntersections(bounds, work), count, "oversize and overflow tags must stay in bounds");
+    }
+
+    const RECT twoRows{0, 0, 100, 40};
+    const std::array<LONG, 3> wide{100, 100, 90};
+    std::array<RECT, wide.size()> mixed{};
+    std::mt19937 random{12};
+    const auto count = tagsearch::LayoutCaptionWindows(twoRows, wide, 20, mixed, random);
+    ExpectEqual(count, std::size_t{2}, "only the two windows in the crowded row should count");
+    ExpectEqual(CountCaptionIntersections(mixed, twoRows), count, "the other row must stay disjoint");
+}
+
+void CaptionLayoutRandomizesPositions() {
     const RECT work{0, 0, 900, 560};
-    std::mt19937 firstSeed{42};
-    std::mt19937 sameSeed{42};
-    std::mt19937 otherSeed{43};
-    const auto first = tagsearch::CaptionSlots(work, {160, 46}, 8, firstSeed);
-    const auto same = tagsearch::CaptionSlots(work, {160, 46}, 8, sameSeed);
-    const auto other = tagsearch::CaptionSlots(work, {160, 46}, 8, otherSeed);
-    const auto equal = [](const RECT& left, const RECT& right) { return EqualRect(&left, &right) != FALSE; };
-    Expect(first.size() > 2 && std::equal(first.begin(), first.end(), same.begin(), same.end(), equal),
-           "a fixed seed should reproduce the slot order");
-    Expect(std::is_permutation(first.begin(), first.end(), other.begin(), other.end(), equal) &&
-           !std::equal(first.begin(), first.end(), other.begin(), other.end(), equal),
-           "a different seed should shuffle the same non-overlapping slots");
+    const std::array<LONG, 5> widths{60, 100, 160, 100, 260};
+    std::array<RECT, widths.size()> first{}, same{}, other{};
+    std::mt19937 firstSeed{42}, sameSeed{42}, otherSeed{43};
+    tagsearch::LayoutCaptionWindows(work, widths, 23, first, firstSeed);
+    tagsearch::LayoutCaptionWindows(work, widths, 23, same, sameSeed);
+    tagsearch::LayoutCaptionWindows(work, widths, 23, other, otherSeed);
+    const auto equal = [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; };
+    Expect(std::equal(first.begin(), first.end(), same.begin(), same.end(), equal),
+           "a fixed seed should reproduce the caption positions");
+    Expect(!std::equal(first.begin(), first.end(), other.begin(), other.end(), equal),
+           "different seeds should change the caption positions");
+    ExpectEqual(CountCaptionIntersections(first, work), std::size_t{0}, "sparse titles should not overlap");
+    ExpectEqual(CountCaptionIntersections(other, work), std::size_t{0}, "different placement should still fit");
 }
 
 void MixedTagQueryMatchesWindowsSearchOrder() {
@@ -398,9 +420,9 @@ int main(int argc, char** argv) {
         {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
         {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
-        {"caption_slots_keep_windows_in_bounds", CaptionSlotsKeepWindowsInBounds},
-        {"caption_slots_handle_tight_fit", CaptionSlotsHandleTightFit},
-        {"caption_slots_shuffle_assignments", CaptionSlotsShuffleAssignments},
+        {"caption_layout_packs_variable_widths", CaptionLayoutPacksVariableWidths},
+        {"caption_layout_keeps_all_crowded_windows_and_counts_overlap", CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap},
+        {"caption_layout_randomizes_positions", CaptionLayoutRandomizesPositions},
         {"mixed_tag_query_matches_windows_search_order", MixedTagQueryMatchesWindowsSearchOrder},
     };
 

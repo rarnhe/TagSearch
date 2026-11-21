@@ -3,11 +3,12 @@
 #include <windows.h>
 
 #include <random>
-#include <vector>
+#include <span>
 
 namespace tagsearch {
 
-// Returns disjoint slots inside the work area, in random order.
-std::vector<RECT> CaptionSlots(const RECT& workArea, SIZE slot, LONG gap, std::mt19937& random);
+// Places one rectangle per width and returns the number of distinct overlapping windows.
+std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths, LONG height,
+                                 std::span<RECT> bounds, std::mt19937& random);
 
 } // namespace tagsearch
