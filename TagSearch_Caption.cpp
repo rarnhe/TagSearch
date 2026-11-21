@@ -5,12 +5,75 @@
 #endif
 
 #include <algorithm>
-#include <iterator>
+#include <cmath>
 #include <map>
 #include <numeric>
 #include <random>
+#include <vector>
 
 namespace tagsearch {
+
+namespace {
+
+bool Overlaps(const RECT& a, const RECT& b) {
+    return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+std::size_t CountOverlappingWindows(std::span<const RECT> bounds) {
+    std::size_t count = 0;
+    for (const auto& rect : bounds) {
+        if (std::any_of(bounds.begin(), bounds.end(), [&](const RECT& other) {
+                return &rect != &other && Overlaps(rect, other);
+            })) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool PlaceCaptionCloud(const RECT& work, std::span<const LONG> widths, LONG height,
+                       std::span<const std::size_t> order, std::span<RECT> bounds,
+                       std::mt19937& random) {
+    const LONG gap = std::max(2L, height / 4);
+    const LONG workWidth = work.right - work.left;
+    const LONG workHeight = work.bottom - work.top;
+    const double area = std::accumulate(widths.begin(), widths.end(), 0.0, [&](double sum, LONG width) {
+        return sum + (std::clamp(width, 1L, workWidth) + gap) * static_cast<double>(height + gap);
+    });
+    if (area > static_cast<double>(workWidth) * workHeight) return false;
+
+    const double radius = std::sqrt(area);
+    const double centerX = work.left + workWidth / 2.0;
+    const double centerY = work.top + workHeight / 2.0;
+    std::normal_distribution<double> cloudX(centerX, radius * 0.55);
+    std::normal_distribution<double> cloudY(centerY, std::max(static_cast<double>(height), radius * 0.34));
+    std::vector<RECT> placed;
+    placed.reserve(widths.size());
+    for (const auto index : order) {
+        const LONG width = std::clamp(widths[index], 1L, workWidth);
+        bool placedTag = false;
+        for (int attempt = 0; attempt < 128; ++attempt) {
+            const double xCenter = cloudX(random);
+            const double yCenter = cloudY(random);
+            const LONG x = static_cast<LONG>(std::clamp(xCenter - width / 2.0,
+                static_cast<double>(work.left), static_cast<double>(work.right - width)));
+            const LONG y = static_cast<LONG>(std::clamp(yCenter - height / 2.0,
+                static_cast<double>(work.top), static_cast<double>(work.bottom - height)));
+            const RECT candidate{x, y, x + width, y + height};
+            const RECT padded{x - gap, y - gap, candidate.right + gap, candidate.bottom + gap};
+            if (std::none_of(placed.begin(), placed.end(), [&](const RECT& rect) { return Overlaps(rect, padded); })) {
+                bounds[index] = candidate;
+                placed.push_back(candidate);
+                placedTag = true;
+                break;
+            }
+        }
+        if (!placedTag) return false;
+    }
+    return true;
+}
+
+} // namespace
 
 std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths, LONG height,
                                  std::span<RECT> bounds, std::mt19937& random) {
@@ -19,11 +82,21 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
     if (widths.empty() || workWidth <= 0 || workHeight <= 0 || height <= 0) return 0;
 
     height = std::min(height, workHeight);
+    std::vector<std::size_t> order(widths.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::shuffle(order.begin(), order.end(), random);
+    std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return widths[a] > widths[b]; });
+    if (PlaceCaptionCloud(work, widths, height, order, bounds, random)) return 0;
+
+    // Pack the full work area more tightly when the cloud cannot fit all titles.
     const LONG rowCount = workHeight / height;
     const LONG top = work.top + (workHeight - rowCount * height) / 2;
-    std::vector<LONG> rowTops(rowCount);
-    for (LONG row = 0; row < rowCount; ++row) rowTops[row] = top + row * height;
-    std::shuffle(rowTops.begin(), rowTops.end(), random);
+    std::vector<LONG> rowTops;
+    for (LONG row = 0; row < rowCount; ++row) rowTops.push_back(top + row * height);
+    const LONG center = work.top + (workHeight - height) / 2;
+    std::stable_sort(rowTops.begin(), rowTops.end(), [&](LONG a, LONG b) {
+        return std::abs(a - center) < std::abs(b - center);
+    });
 
     struct Row {
         LONG usedWidth = 0;
@@ -33,18 +106,12 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
     std::vector<Row> rows(rowCount);
     std::multimap<LONG, std::size_t> available;
     for (std::size_t row = 0; row < rows.size(); ++row) available.emplace(workWidth, row);
-    std::vector<std::size_t> order(widths.size());
-    std::iota(order.begin(), order.end(), std::size_t{0});
-    std::shuffle(order.begin(), order.end(), random);
-    std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return widths[a] > widths[b]; });
 
     const auto windowWidth = [&](std::size_t index) { return std::clamp(widths[index], 1L, workWidth); };
-    const bool spreadOut = widths.size() <= rows.size();
     std::uniform_int_distribution<std::size_t> randomRow(0, rows.size() - 1);
-    // Pack wide titles first. Sparse layouts get one title per randomly selected row.
     for (auto index : order) {
         const LONG width = windowWidth(index);
-        const auto fit = spreadOut ? std::prev(available.end()) : available.lower_bound(width);
+        const auto fit = available.lower_bound(width);
         if (fit == available.end()) {
             rows[randomRow(random)].overflow.push_back(index);
             continue;
@@ -56,39 +123,23 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
         available.emplace(remaining - width, row);
     }
 
-    std::size_t overlapping = 0;
     for (std::size_t row = 0; row < rows.size(); ++row) {
         auto& [usedWidth, packed, overflow] = rows[row];
         const LONG y = rowTops[row];
         std::shuffle(packed.begin(), packed.end(), random);
-        LONG x = work.left + std::uniform_int_distribution<LONG>(0, workWidth - usedWidth)(random);
+        LONG x = work.left + (workWidth - usedWidth) / 2;
         for (auto index : packed) {
             const LONG right = x + windowWidth(index);
             bounds[index] = {x, y, right, y + height};
             x = right;
         }
-        if (overflow.empty()) continue;
-
         for (auto index : overflow) {
             const LONG width = windowWidth(index);
             x = work.left + std::uniform_int_distribution<LONG>(0, workWidth - width)(random);
             bounds[index] = {x, y, x + width, y + height};
         }
-
-        // Different rows are disjoint. Within a row, count each intersecting title once.
-        packed.insert(packed.end(), overflow.begin(), overflow.end());
-        std::sort(packed.begin(), packed.end(), [&](auto a, auto b) { return bounds[a].left < bounds[b].left; });
-        LONG farthestRight = work.left;
-        for (std::size_t i = 0; i < packed.size(); ++i) {
-            const auto& rect = bounds[packed[i]];
-            if (rect.left < farthestRight ||
-                (i + 1 < packed.size() && bounds[packed[i + 1]].left < rect.right)) {
-                ++overlapping;
-            }
-            farthestRight = std::max(farthestRight, rect.right);
-        }
     }
-    return overlapping;
+    return CountOverlappingWindows(bounds);
 }
 
 } // namespace tagsearch
@@ -98,8 +149,8 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <windowsx.h>
-#include <cmath>
 #include <cwchar>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <system_error>
@@ -123,7 +174,6 @@ constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
 constexpr UINT kOverlapNotice = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
-constexpr UINT kOverlapIcon = 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
 constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW;
 using tagsearch::TagOperator;
@@ -149,8 +199,10 @@ struct FloatingTag {
     HWND window = nullptr;
     bool pressed = false;
     bool dragging = false;
+    bool moved = false;
     POINT start{};
     POINT last{};
+    std::vector<tagsearch::TagSearchTerm> clickTerms;
 };
 
 struct ScanResult {
@@ -165,18 +217,18 @@ struct Caption {
     std::vector<std::unique_ptr<FloatingTag>> tags;
     std::mt19937 random{std::random_device{}()};
     tagsearch::Folders folders;
-    bool overlapNoticeActive = false;
+    UINT overlapIcon = 0;
+    UINT lastOverlapIcon = 0;
     ScanResult scan;
     std::jthread scanner;
 
     void DismissOverlapNotice() {
-        if (!overlapNoticeActive) return;
+        if (!overlapIcon) return;
         NOTIFYICONDATAW notice{sizeof(notice)};
         notice.hWnd = controller;
-        notice.uID = kOverlapIcon;
+        notice.uID = std::exchange(overlapIcon, 0);
         Shell_NotifyIconW(NIM_DELETE, &notice);
-        KillTimer(controller, kOverlapIcon);
-        overlapNoticeActive = false;
+        KillTimer(controller, notice.uID);
     }
 
     ~Caption() {
@@ -209,26 +261,141 @@ void ApplyTagColor(HWND window, TagOperator operation) {
     DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &color, sizeof(color));
 }
 
-void NotifyOverlap(Caption& caption, std::size_t count) {
-    if (count == 0) return;
+std::vector<tagsearch::TagWindowBounds> VisibleTagsInZOrder(const Caption& caption) {
+    std::vector<tagsearch::TagWindowBounds> windows;
+    windows.reserve(caption.tags.size());
+    for (HWND hwnd = GetTopWindow(nullptr); hwnd; hwnd = GetWindow(hwnd, GW_HWNDNEXT)) {
+        RECT rect{};
+        if (GetWindow(hwnd, GW_OWNER) != caption.controller ||
+            !IsWindowVisible(hwnd) || !GetWindowRect(hwnd, &rect)) continue;
+        const auto* tag = reinterpret_cast<const FloatingTag*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (tag) windows.push_back({rect, tag->text, tag->operation});
+    }
+    std::reverse(windows.begin(), windows.end());
+    return windows;
+}
+
+using TagGroup = std::vector<std::size_t>;
+
+TagGroup CollectOverlapGroup(std::span<const tagsearch::TagWindowBounds> windows, std::size_t selected,
+                             std::vector<bool>& visited) {
+    TagGroup group{selected};
+    visited[selected] = true;
+    for (std::size_t next = 0; next < group.size(); ++next) {
+        const auto& rect = windows[group[next]].bounds;
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            if (!visited[i] && tagsearch::Overlaps(rect, windows[i].bounds)) {
+                visited[i] = true;
+                group.push_back(i);
+            }
+        }
+    }
+    std::sort(group.begin(), group.end());
+    return group;
+}
+
+std::vector<TagGroup> OverlapGroups(std::span<const tagsearch::TagWindowBounds> windows) {
+    std::vector<TagGroup> groups;
+    std::vector<bool> visited(windows.size());
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        if (visited[i]) continue;
+        auto group = CollectOverlapGroup(windows, i, visited);
+        if (group.size() > 1) groups.push_back(std::move(group));
+    }
+    return groups;
+}
+
+template <typename FitsLine>
+std::wstring FormatOverlapLines(std::span<const tagsearch::TagWindowBounds> windows,
+                                std::span<const TagGroup> groups, std::size_t limit, FitsLine fitsLine) {
+    constexpr std::wstring_view ellipsis = L"...";
+    std::wstring message;
+    for (const auto& group : groups) {
+        const std::size_t separator = message.empty() ? 0 : 1;
+        const std::size_t available = limit - message.size();
+        if (available < separator + ellipsis.size()) break;
+
+        std::wstring line;
+        for (const auto index : group) {
+            if (!line.empty()) line += L'·';
+            line += windows[index].tag;
+        }
+        std::replace_if(line.begin(), line.end(), [](wchar_t ch) {
+            return ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == 0x2028 || ch == 0x2029;
+        }, L' ');
+
+        const auto lineLimit = available - separator;
+        if (line.size() > lineLimit || !fitsLine(line)) {
+            line.resize(std::min(line.size(), lineLimit - ellipsis.size()));
+            for (;;) {
+                if (!line.empty() && ((line.back() >= 0xd800 && line.back() <= 0xdbff) || line.back() == L'·')) {
+                    line.pop_back();
+                    continue;
+                }
+                line += ellipsis;
+                if (line.size() == ellipsis.size() || fitsLine(line)) break;
+                line.resize(line.size() - ellipsis.size() - 1);
+            }
+        }
+
+        if (separator) message += L'\n';
+        message += line;
+    }
+    return message;
+}
+
+std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindowBounds> windows,
+                               std::span<const TagGroup> groups, std::size_t limit) {
+    const UINT dpi = WindowDpi(window);
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    const HFONT font = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)
+        ? CreateFontIndirectW(&metrics.lfMessageFont) : nullptr;
+    const HDC dc = GetDC(window);
+    const auto original = dc && font ? SelectObject(dc, font) : nullptr;
+    // Leave room for the Shell's icon and margins.
+    const int lineWidth = Scale(220, dpi);
+    const auto message = FormatOverlapLines(windows, groups, limit, [&](std::wstring_view line) {
+        SIZE text{};
+        if (dc && GetTextExtentPoint32W(dc, line.data(), static_cast<int>(line.size()), &text)) {
+            return text.cx <= lineWidth;
+        }
+        return line.size() <= 24;
+    });
+    if (dc) {
+        if (original) SelectObject(dc, original);
+        ReleaseDC(window, dc);
+    }
+    if (font) DeleteObject(font);
+    return message;
+}
+
+void UpdateOverlapNotice(Caption& caption) {
+    const auto windows = VisibleTagsInZOrder(caption);
+    const auto groups = OverlapGroups(windows);
+    caption.DismissOverlapNotice();
+    if (groups.empty()) return;
+
     NOTIFYICONDATAW notice{sizeof(notice)};
     notice.hWnd = caption.controller;
-    notice.uID = kOverlapIcon;
+    // A queued callback from an older balloon must not dismiss this one.
+    caption.lastOverlapIcon = caption.lastOverlapIcon % 0xffff + 1;
+    notice.uID = caption.lastOverlapIcon;
     notice.uFlags = NIF_ICON | NIF_MESSAGE;
     notice.uCallbackMessage = kOverlapNotice;
     notice.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     if (!Shell_NotifyIconW(NIM_ADD, &notice)) return;
 
-    caption.overlapNoticeActive = true;
+    caption.overlapIcon = notice.uID;
     notice.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &notice);
     notice.uFlags = NIF_INFO;
     notice.dwInfoFlags = NIIF_INFO;
-    wcscpy_s(notice.szInfoTitle, L"TagSearch");
-    const auto message = L"可能发生重叠的标签个数 「" + std::to_wstring(count) + L"」";
+    const auto title = L"重叠标签组 「" + std::to_wstring(groups.size()) + L"」";
+    wcscpy_s(notice.szInfoTitle, title.c_str());
+    const auto message = OverlapNoticeBody(caption.controller, windows, groups, std::size(notice.szInfo) - 1);
     wcscpy_s(notice.szInfo, message.c_str());
     if (!Shell_NotifyIconW(NIM_MODIFY, &notice) ||
-        !SetTimer(caption.controller, kOverlapIcon, 60000, nullptr)) {
+        !SetTimer(caption.controller, notice.uID, 60000, nullptr)) {
         caption.DismissOverlapNotice();
     }
 }
@@ -239,21 +406,23 @@ bool PastDragThreshold(HWND window, const FloatingTag& tag, POINT point) {
            std::abs(point.y - tag.start.y) >= GetSystemMetricsForDpi(SM_CYDRAG, dpi);
 }
 
-void ActivateTag(HWND window, const FloatingTag& tag) {
-    // Use current screen coordinates so dragging a tag changes the next search.
-    RECT selected{};
-    std::vector<tagsearch::TagWindowBounds> visibleWindows;
-    if (GetWindowRect(window, &selected)) {
-        for (const auto& other : tag.caption.tags) {
-            RECT bounds{};
-            if (other->window != window && IsWindowVisible(other->window) &&
-                GetWindowRect(other->window, &bounds)) {
-                visibleWindows.push_back({bounds, other->text, other->operation});
-            }
-        }
-    }
-    const auto terms = tagsearch::TermsForOverlappingWindows(
-        {selected, tag.text, tag.operation}, visibleWindows);
+std::vector<tagsearch::TagSearchTerm> TermsAtCurrentZOrder(const FloatingTag& tag) {
+    const auto windows = VisibleTagsInZOrder(tag.caption);
+    const auto selected = std::find_if(windows.begin(), windows.end(), [&](const auto& window) {
+        return window.tag == tag.text;
+    });
+    if (selected == windows.end()) return {{tag.text, tag.operation}};
+
+    std::vector<bool> visited(windows.size());
+    const auto group = CollectOverlapGroup(windows, static_cast<std::size_t>(selected - windows.begin()), visited);
+    std::vector<tagsearch::TagSearchTerm> terms;
+    terms.reserve(group.size());
+    for (const auto index : group) terms.push_back({std::wstring(windows[index].tag), windows[index].operation});
+    return terms;
+}
+
+void ActivateTag(HWND window, const FloatingTag& tag, std::vector<tagsearch::TagSearchTerm> terms) {
+    if (terms.empty()) terms = TermsAtCurrentZOrder(tag);
     if (!tagsearch::OpenTagQuery(window, terms, tag.caption.folders)) {
         MessageBoxW(window, L"无法在文件资源管理器中打开标签搜索。", L"TagSearch", MB_OK | MB_ICONWARNING);
     }
@@ -294,6 +463,13 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_THEMECHANGED:
         ApplyTagColor(window, tag->operation);
         break;
+    case WM_MOUSEACTIVATE:
+        // Mouse activation can raise a lower window before the click is dispatched.
+        if (LOWORD(lParam) == HTCAPTION &&
+            (HIWORD(lParam) == WM_NCLBUTTONDOWN || HIWORD(lParam) == WM_LBUTTONDOWN)) {
+            tag->clickTerms = TermsAtCurrentZOrder(*tag);
+        }
+        break;
     case WM_NCLBUTTONDOWN:
         if (wParam != HTCAPTION) break;
         [[fallthrough]];
@@ -302,6 +478,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             tag->last = tag->start;
             tag->pressed = true;
             tag->dragging = false;
+            tag->moved = false;
             SetCapture(window);
         }
         return 0;
@@ -317,7 +494,11 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
                     const LONG maxY = std::max(work.top, work.bottom - (bounds.bottom - bounds.top));
                     const LONG x = std::clamp(bounds.left + point.x - tag->last.x, work.left, maxX);
                     const LONG y = std::clamp(bounds.top + point.y - tag->last.y, work.top, maxY);
-                    SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
+                    if ((x != bounds.left || y != bounds.top) &&
+                        SetWindowPos(window, HWND_TOP, x, y, 0, 0,
+                                     SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOOWNERZORDER)) {
+                        tag->moved = true;
+                    }
                 }
                 tag->last = point;
             }
@@ -329,19 +510,24 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             POINT point{};
             const bool clicked = !tag->dragging && GetCursorPos(&point) &&
                                  !PastDragThreshold(window, *tag, point);
+            const bool moved = std::exchange(tag->moved, false);
+            auto terms = std::move(tag->clickTerms);
             tag->pressed = false;
             ReleaseCapture();
-            if (clicked) ActivateTag(window, *tag);
+            if (clicked) ActivateTag(window, *tag, std::move(terms));
+            if (moved) UpdateOverlapNotice(tag->caption);
             return 0;
         }
         break;
     case WM_CAPTURECHANGED:
         tag->pressed = false;
         tag->dragging = false;
+        tag->moved = false;
+        tag->clickTerms.clear();
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
-            if ((HIWORD(lParam) & KF_REPEAT) == 0) ActivateTag(window, *tag);
+            if ((HIWORD(lParam) & KF_REPEAT) == 0) ActivateTag(window, *tag, {});
             return 0;
         }
         if (wParam == VK_ESCAPE) {
@@ -373,15 +559,15 @@ std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& tex
     return tag->window ? std::move(tag) : nullptr;
 }
 
-std::optional<std::size_t> PositionTags(Caption& caption) {
+bool PositionTags(Caption& caption) {
     const RECT work = PrimaryWorkArea();
-    if (IsRectEmpty(&work)) return std::nullopt;
+    if (IsRectEmpty(&work)) return false;
     SetWindowPos(caption.controller, nullptr, work.left, work.top, 0, 0,
                  SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE);
     const UINT dpi = WindowDpi(caption.controller);
     RECT frame{};
     if (!AdjustWindowRectExForDpi(&frame, kTagStyle, FALSE, kTagExStyle, dpi) ||
-        frame.bottom <= frame.top) return std::nullopt;
+        frame.bottom <= frame.top) return false;
 
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     const HFONT font = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)
@@ -390,10 +576,12 @@ std::optional<std::size_t> PositionTags(Caption& caption) {
     const auto oldFont = dc && font ? SelectObject(dc, font) : nullptr;
     std::vector<LONG> widths;
     widths.reserve(caption.tags.size());
+    constexpr int titlePadding = 6;
+    const LONG frameWidth = frame.right - frame.left;
     for (const auto& tag : caption.tags) {
         SIZE text{};
         if (dc) GetTextExtentPoint32W(dc, tag->text.c_str(), static_cast<int>(tag->text.size()), &text);
-        widths.push_back(std::max<LONG>(Scale(52, dpi), text.cx + frame.right - frame.left + Scale(24, dpi)));
+        widths.push_back(text.cx + frameWidth + 2 * Scale(titlePadding, dpi));
     }
     if (dc) {
         if (oldFont) SelectObject(dc, oldFont);
@@ -403,15 +591,15 @@ std::optional<std::size_t> PositionTags(Caption& caption) {
 
     std::vector<RECT> bounds(widths.size());
     const LONG height = frame.bottom - frame.top;
-    const auto overlap = tagsearch::LayoutCaptionWindows(work, widths, height, bounds, caption.random);
+    tagsearch::LayoutCaptionWindows(work, widths, height, bounds, caption.random);
     for (std::size_t i = 0; i < bounds.size(); ++i) {
         const auto& rect = bounds[i];
         if (!SetWindowPos(caption.tags[i]->window, nullptr, rect.left, rect.top,
                           rect.right - rect.left, rect.bottom - rect.top, SWP_NOACTIVATE | SWP_NOZORDER)) {
-            return std::nullopt;
+            return false;
         }
     }
-    return overlap;
+    return true;
 }
 
 void ActivateTags(Caption& caption) {
@@ -482,13 +670,12 @@ void ShowScanResult(Caption& caption) {
         PostQuitMessage(0);
         return;
     }
-    const auto overlapping = PositionTags(caption);
-    if (!overlapping) {
+    if (!PositionTags(caption)) {
         PostQuitMessage(1);
         return;
     }
     ActivateTags(caption);
-    NotifyOverlap(caption, *overlapping);
+    UpdateOverlapNotice(caption);
 }
 
 LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -517,13 +704,14 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
         if (!caption->tags.empty()) PositionTags(*caption);
         return 0;
     case kOverlapNotice:
-        if (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT ||
-            LOWORD(lParam) == NIN_BALLOONUSERCLICK) {
+        if (HIWORD(lParam) == caption->overlapIcon &&
+            (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT ||
+             LOWORD(lParam) == NIN_BALLOONUSERCLICK)) {
             caption->DismissOverlapNotice();
         }
         return 0;
     case WM_TIMER:
-        if (wParam != kOverlapIcon) break;
+        if (wParam != caption->overlapIcon) break;
         caption->DismissOverlapNotice();
         return 0;
     case WM_CLOSE:
