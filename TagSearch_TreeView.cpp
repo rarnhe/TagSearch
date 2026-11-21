@@ -1,5 +1,4 @@
 #include "TagSearch_Core.h"
-#include "TagSearch_EntryPoint.h"
 
 #include <commctrl.h>
 #include <propkey.h>
@@ -16,6 +15,13 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+
+// Each executable supplies this externally linked entry point for the CRT.
+int WINAPI wWinMain(
+    _In_ HINSTANCE instance,
+    _In_opt_ HINSTANCE previousInstance,
+    _In_ LPWSTR commandLine,
+    _In_ int showCommand);
 
 namespace tagsearch::treeview {
 namespace {

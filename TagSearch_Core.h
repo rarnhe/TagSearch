@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -20,13 +21,24 @@ using Tags = std::vector<std::wstring>;
 Tags SplitKeywords(std::wstring_view value);
 Tags NormalizeTags(Tags tags);
 
+enum class TagOperator { And, Or, Not };
+
+struct TagSearchTerm {
+    std::wstring tag;
+    TagOperator operation = TagOperator::And;
+
+    bool operator==(const TagSearchTerm&) const = default;
+};
+
 struct TagWindowBounds {
     RECT bounds;
     std::wstring_view tag;
+    TagOperator operation = TagOperator::And;
 };
 
-Tags TagsForOverlappingWindows(
-    const TagWindowBounds& selected, const std::vector<TagWindowBounds>& visibleWindows);
+std::vector<TagSearchTerm> TermsForOverlappingWindows(
+    const TagWindowBounds& selected, std::span<const TagWindowBounds> visibleWindows);
+std::wstring FormatTagQuery(std::span<const TagSearchTerm> terms);
 
 // Pass a complete Unicode command line, including argv[0].
 Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount = nullptr);
@@ -35,6 +47,9 @@ Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCou
 Tags ScanTags(const Folders& folders, std::stop_token stop = {});
 HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result);
 HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result);
+HRESULT CreateTagQueryCondition(std::span<const TagSearchTerm> terms, ICondition** result);
+HRESULT CreateTagQueryFolder(std::span<const TagSearchTerm> terms, const Folders& folders, PIDLIST_ABSOLUTE* result);
+bool OpenTagQuery(HWND owner, std::span<const TagSearchTerm> terms, const Folders& folders);
 bool OpenTagSearch(HWND owner, const Tags& tags, const Folders& folders);
 
 } // namespace tagsearch

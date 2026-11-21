@@ -2,6 +2,7 @@
 
 #include <shlobj.h>
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -66,7 +67,7 @@ struct Process {
         }
         Expect(CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
                              nullptr, nullptr, &startup, &info) != FALSE,
-               "CreateProcessW should launch TreeView");
+               "CreateProcessW should launch TagSearch");
         CloseHandle(info.hThread);
     }
 
@@ -88,14 +89,14 @@ struct Process {
     }
 };
 
-HWND WaitForPanel(const Process& process) {
+HWND WaitForPanel(const Process& process, const wchar_t* className = L"TagSearchTreeView", bool visible = true) {
     HWND window = nullptr;
     Expect(WaitUntil([&] {
-        window = FindWindowW(L"TagSearchTreeView", nullptr);
+        window = FindWindowW(className, nullptr);
         DWORD processId = 0;
         return window && GetWindowThreadProcessId(window, &processId) &&
-               processId == process.info.dwProcessId && IsWindowVisible(window);
-    }), "the launch should show its own panel");
+               processId == process.info.dwProcessId && (IsWindowVisible(window) != FALSE) == visible;
+    }), "the launch should create its own window with the expected visibility");
     return window;
 }
 
@@ -192,17 +193,107 @@ void CheckFixedWindowAndTitle(const fs::path& executable) {
     ClosePanel(window, process);
 }
 
+struct VisibleTags {
+    HWND controller;
+    bool unexpectedVisibleWindow = false;
+    std::vector<HWND> windows;
+    std::vector<RECT> bounds;
+    tagsearch::Tags titles;
+};
+
+BOOL CALLBACK RecordVisibleTags(HWND window, LPARAM parameter) {
+    auto& tags = *reinterpret_cast<VisibleTags*>(parameter);
+    if (!IsWindowVisible(window)) return TRUE;
+    std::array<wchar_t, 128> className{};
+    GetClassNameW(window, className.data(), static_cast<int>(className.size()));
+    if (GetWindow(window, GW_OWNER) != tags.controller || std::wstring_view(className.data()) != L"TagSearchFloatingTag") {
+        tags.unexpectedVisibleWindow = true;
+        return TRUE;
+    }
+    RECT rect{};
+    if (GetWindowRect(window, &rect)) {
+        std::array<wchar_t, 128> title{};
+        GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+        tags.windows.push_back(window);
+        tags.bounds.push_back(rect);
+        tags.titles.emplace_back(title.data());
+    }
+    return TRUE;
+}
+
+bool Within(const RECT& rect, const RECT& area) {
+    return rect.left >= area.left && rect.top >= area.top &&
+           rect.right <= area.right && rect.bottom <= area.bottom;
+}
+
+void RecordCaptionPage(DWORD threadId, VisibleTags& tags) {
+    tags.unexpectedVisibleWindow = false;
+    tags.windows.clear();
+    tags.bounds.clear();
+    tags.titles.clear();
+    EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
+}
+
+void CheckTagBounds(const VisibleTags& tags, const RECT& work) {
+    for (std::size_t i = 0; i < tags.bounds.size(); ++i) {
+        const auto& rect = tags.bounds[i];
+        RECT overlap{};
+        Expect(Within(rect, work), "the tag window must stay inside the primary work area");
+        for (std::size_t j = 0; j < i; ++j) {
+            Expect(!IntersectRect(&overlap, &rect, &tags.bounds[j]), "the laid-out tag windows must not overlap");
+        }
+    }
+}
+
+void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
+    const TestCopy copy(executable);
+    fs::copy_file(fixture, copy.directory / L"tagged.jpg");
+    const Process first(copy.executable, {copy.directory});
+    const HWND controller = WaitForPanel(first, L"TagSearchCaptionController", false);
+    MONITORINFO monitor{sizeof(monitor)};
+    const POINT origin{};
+    Expect(GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &monitor),
+           "the test should read the primary work area");
+
+    VisibleTags tags{controller};
+    const DWORD threadId = GetWindowThreadProcessId(controller, nullptr);
+    Expect(WaitUntil([&] {
+        RecordCaptionPage(threadId, tags);
+        return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
+               std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
+    }), "the background scan should show both labels from the JPEG fixture");
+    Expect(!tags.unexpectedVisibleWindow, "only real tag windows should be visible after the scan");
+    CheckTagBounds(tags, monitor.rcWork);
+
+    const auto originalWindows = tags.windows;
+    const HWND tag = originalWindows.front();
+    Expect(ShowWindowAsync(tag, SW_HIDE) && WaitUntil([&] { return !IsWindowVisible(tag); }),
+           "the test should hide a tag before starting Caption again");
+    const Process second(copy.executable);
+    second.ExpectSuccessfulExit("Caption's duplicate launch should forward activation and exit");
+    Expect(WaitUntil([&] { return IsWindowVisible(tag); }),
+           "the duplicate launch should restore the existing tag window");
+    RecordCaptionPage(threadId, tags);
+    Expect(!tags.unexpectedVisibleWindow &&
+           std::is_permutation(originalWindows.begin(), originalWindows.end(), tags.windows.begin(), tags.windows.end()),
+           "activation should restore the original tags and keep the controller hidden");
+    CheckTagBounds(tags, monitor.rcWork);
+    ClosePanel(controller, first);
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return 2;
+    if (argc < 3 || argc > 4) return 2;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const std::wstring_view mode = argv[1];
-        if (mode == L"startup") {
+        if (mode == L"startup" && argc == 3) {
             CheckStartup(argv[2]);
-        } else if (mode == L"fixed-window") {
+        } else if (mode == L"fixed-window" && argc == 3) {
             CheckFixedWindowAndTitle(argv[2]);
+        } else if (mode == L"caption" && argc == 4) {
+            CheckCaptionLayout(argv[2], argv[3]);
         } else {
             return 2;
         }

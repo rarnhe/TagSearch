@@ -2,9 +2,13 @@ if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "TagSearch tests require Windows, MSVC and the Windows SDK")
 endif()
 
-add_executable(tagsearch_tests test_tagsearch.cpp)
+# Compile the production layout directly, without the Win32 app entry point.
+add_executable(tagsearch_tests test_tagsearch.cpp ../TagSearch_Caption.cpp TagSearch_Layout.h)
 target_link_libraries(tagsearch_tests PRIVATE TagSearchCore)
-target_compile_definitions(tagsearch_tests PRIVATE TAGSEARCH_FIXTURE=L"${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
+target_compile_definitions(tagsearch_tests PRIVATE
+    TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
+    TAGSEARCH_FIXTURE=L"${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg"
+)
 target_compile_options(tagsearch_tests PRIVATE /utf-8)
 
 set(cases
@@ -23,6 +27,10 @@ set(cases
     search_condition_keeps_one_tag_literal
     search_condition_combines_all_tags_with_and
     create_search_folder_accepts_combined_tags
+    caption_slots_keep_windows_in_bounds
+    caption_slots_handle_tight_fit
+    caption_slots_shuffle_assignments
+    mixed_tag_query_matches_windows_search_order
 )
 
 foreach(case IN LISTS cases)
@@ -30,14 +38,18 @@ foreach(case IN LISTS cases)
     set_tests_properties(${case} PROPERTIES TIMEOUT 20 RUN_SERIAL TRUE)
 endforeach()
 
-add_executable(tagsearch_treeview_startup_test test_treeview_startup.cpp)
-target_link_libraries(tagsearch_treeview_startup_test PRIVATE TagSearchCore)
-target_compile_options(tagsearch_treeview_startup_test PRIVATE /utf-8)
-add_dependencies(tagsearch_treeview_startup_test TagSearch_TreeView)
+add_executable(tagsearch_window_startup_test test_window_startup.cpp)
+target_link_libraries(tagsearch_window_startup_test PRIVATE TagSearchCore)
+target_compile_options(tagsearch_window_startup_test PRIVATE /utf-8)
+add_dependencies(tagsearch_window_startup_test TagSearch_TreeView TagSearch_Caption)
 
 add_test(NAME treeview_single_instance_startup
-         COMMAND tagsearch_treeview_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
+         COMMAND tagsearch_window_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
 add_test(NAME treeview_fixed_window_and_folder_title
-         COMMAND tagsearch_treeview_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+         COMMAND tagsearch_window_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+add_test(NAME caption_background_scan_and_random_tag_windows
+         COMMAND tagsearch_window_startup_test caption $<TARGET_FILE:TagSearch_Caption>
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
+                     caption_background_scan_and_random_tag_windows
                      PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
