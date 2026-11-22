@@ -1,5 +1,6 @@
 #include "TagSearch_Core.h"
 
+#include <dwmapi.h>
 #include <propkey.h>
 #include <propsys.h>
 #include <shellapi.h>
@@ -118,6 +119,13 @@ Tags SplitKeywords(std::wstring_view value) {
     }
 
     return tags;
+}
+
+COLORREF WindowAccentColor() {
+    DWORD argb = 0;
+    BOOL opaque = FALSE;
+    if (FAILED(DwmGetColorizationColor(&argb, &opaque))) return GetSysColor(COLOR_HIGHLIGHT);
+    return RGB((argb >> 16) & 0xff, (argb >> 8) & 0xff, argb & 0xff);
 }
 
 Tags NormalizeTags(Tags tags) {

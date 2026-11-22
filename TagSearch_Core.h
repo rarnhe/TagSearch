@@ -23,6 +23,7 @@ using IconResource = std::pair<std::filesystem::path, int>;
 
 Tags SplitKeywords(std::wstring_view value);
 Tags NormalizeTags(Tags tags);
+COLORREF WindowAccentColor();
 
 enum class TagOperator { And, Or, Not };
 

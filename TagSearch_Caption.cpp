@@ -20,6 +20,8 @@ namespace tagsearch {
 
 namespace {
 
+constexpr int kTitlePadding = 4;
+
 bool Overlaps(const RECT& a, const RECT& b) {
     return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
 }
@@ -222,7 +224,7 @@ HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::
 }
 
 HBITMAP CreateCaptionBitmap(HDC dc, SIZE size, const std::wstring& label,
-                            HFONT font, COLORREF color, LONG padding) {
+                            HFONT font, COLORREF color, COLORREF accent, UINT dpi) {
     if (size.cx <= 0 || size.cy <= 0) return nullptr;
 
     BITMAPINFO image{};
@@ -247,19 +249,42 @@ HBITMAP CreateCaptionBitmap(HDC dc, SIZE size, const std::wstring& label,
     const auto previousFont = font ? SelectObject(dc, font) : nullptr;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
+    const LONG padding = MulDiv(kTitlePadding, dpi, USER_DEFAULT_SCREEN_DPI);
     RECT text{padding, 0, std::max(padding, size.cx - padding), size.cy};
     DrawTextW(dc, label.c_str(), -1, &text,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     GdiFlush();
 
-    const auto count = static_cast<std::size_t>(size.cx) * size.cy;
-    for (auto& pixel : std::span(static_cast<DWORD*>(data), count)) {
-        // Zero-alpha pixels let mouse clicks pass through layered windows.
-        const DWORD alpha = std::max<DWORD>(1, 255 - (pixel & 0xff));
-        const DWORD red = (GetRValue(color) * alpha + 127) / 255;
-        const DWORD green = (GetGValue(color) * alpha + 127) / 255;
-        const DWORD blue = (GetBValue(color) * alpha + 127) / 255;
-        pixel = (alpha << 24) | (red << 16) | (green << 8) | blue;
+    // DWM does not round per-pixel layered windows. Draw the rounded
+    // outline and inset border into the same premultiplied alpha bitmap.
+    const double halfWidth = size.cx / 2.0;
+    const double halfHeight = size.cy / 2.0;
+    const double radius = std::min({static_cast<double>(MulDiv(8, dpi, USER_DEFAULT_SCREEN_DPI)),
+                                    halfWidth, halfHeight});
+    const double border = std::max(1, MulDiv(1, dpi, USER_DEFAULT_SCREEN_DPI));
+    const auto coverage = [](double distance) {
+        return static_cast<DWORD>(std::lround(255.0 * std::clamp(distance, 0.0, 1.0)));
+    };
+
+    auto* pixel = static_cast<DWORD*>(data);
+    for (LONG y = 0; y < size.cy; ++y) {
+        const double dy = std::abs(y + 0.5 - halfHeight) - (halfHeight - radius);
+        for (LONG x = 0; x < size.cx; ++x, ++pixel) {
+            const double dx = std::abs(x + 0.5 - halfWidth) - (halfWidth - radius);
+            const double distance = dx > 0 && dy > 0 ? std::sqrt(dx * dx + dy * dy) : std::max(dx, dy);
+            const DWORD outer = coverage(radius + 0.5 - distance);
+            const DWORD inner = coverage(radius + 0.5 - distance - border);
+            const DWORD edgeAlpha = outer - inner;
+
+            // Reserve one alpha step so mouse clicks still reach the title through its glyphs.
+            const DWORD glyphAlpha = std::max<DWORD>(1, 255 - (*pixel & 0xff));
+            const DWORD fillAlpha = (inner * glyphAlpha + 127) / 255;
+            const DWORD alpha = edgeAlpha + fillAlpha;
+            const DWORD red = (GetRValue(accent) * edgeAlpha + GetRValue(color) * fillAlpha + 127) / 255;
+            const DWORD green = (GetGValue(accent) * edgeAlpha + GetGValue(color) * fillAlpha + 127) / 255;
+            const DWORD blue = (GetBValue(accent) * edgeAlpha + GetBValue(color) * fillAlpha + 127) / 255;
+            *pixel = (alpha << 24) | (red << 16) | (green << 8) | blue;
+        }
     }
 
     if (previousFont) SelectObject(dc, previousFont);
@@ -301,7 +326,6 @@ constexpr UINT kScanStarted = WM_APP + 6;
 constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
 constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
-constexpr int kTitlePadding = 4;
 using tagsearch::TagOperator;
 
 struct TagMode {
@@ -393,6 +417,7 @@ struct Caption {
     HWND controller = nullptr;
     OwnedFont titleFont{nullptr, &DeleteObject};
     OwnedFont boldTitleFont{nullptr, &DeleteObject};
+    COLORREF accent = tagsearch::WindowAccentColor();
     std::vector<std::unique_ptr<FloatingTag>> tags;
     std::mt19937 random{std::random_device{}()};
     tagsearch::Folders folders;
@@ -467,10 +492,10 @@ bool PaintCaption(HWND window, const FloatingTag& tag, const RECT& bounds) {
     const MemoryDc dc{CreateCompatibleDC(nullptr), &DeleteDC};
     if (!dc) return false;
 
-    const auto& font = tag.pressed ? tag.caption.titleFont : tag.caption.boldTitleFont;
+    const auto& font = tag.pressed ? tag.caption.boldTitleFont : tag.caption.titleFont;
     const COLORREF color = kTagModes[static_cast<std::size_t>(tag.operation)].color;
     bitmap.reset(tagsearch::CreateCaptionBitmap(dc.get(), size, tag.text, font.get(), color,
-                                               Scale(kTitlePadding, WindowDpi(window))));
+                                               tag.caption.accent, WindowDpi(window)));
     if (!bitmap || !SelectObject(dc.get(), bitmap.get())) return false;
 
     POINT origin{bounds.left, bounds.top};
@@ -897,7 +922,7 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
         }
         if (previousFont) SelectObject(dc, previousFont);
     }
-    const LONG padding = Scale(kTitlePadding, dpi);
+    const LONG padding = Scale(tagsearch::kTitlePadding, dpi);
     for (auto& width : widths) width += 2 * padding;
     if (dc) {
         if (oldFont) SelectObject(dc, oldFont);
@@ -1003,6 +1028,13 @@ void ShowScanResult(Caption& caption) {
     caption.QuitIfNoNotices();
 }
 
+void RefreshAccentBorder(Caption& caption) {
+    const COLORREF accent = tagsearch::WindowAccentColor();
+    if (caption.accent == accent) return;
+    caption.accent = accent;
+    for (const auto& tag : caption.tags) RedrawCaption(tag->window, *tag);
+}
+
 LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_NCCREATE) {
         const auto create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
@@ -1026,12 +1058,18 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
         ActivateTags(*caption);
         return 0;
     case WM_SETTINGCHANGE:
+        RefreshAccentBorder(*caption);
         if (wParam != SPI_SETWORKAREA) break;
         [[fallthrough]];
     case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
         PostMessageW(window, kReflow, 0, 0);
         return 0;
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+        RefreshAccentBorder(*caption);
+        break;
     case kReflow:
         if (!caption->tags.empty()) PositionTags(*caption);
         return 0;

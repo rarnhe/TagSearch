@@ -11,13 +11,13 @@ add_library(TagSearchCore STATIC TagSearch_Core.cpp TagSearch_Core.h)
 target_include_directories(TagSearchCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(TagSearchCore PUBLIC cxx_std_20)
 target_compile_definitions(TagSearchCore PUBLIC UNICODE _UNICODE NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
-target_link_libraries(TagSearchCore PUBLIC shell32 ole32 propsys uuid structuredquery)
+target_link_libraries(TagSearchCore PUBLIC shell32 ole32 propsys uuid structuredquery dwmapi)
 
 add_executable(TagSearch_TreeView WIN32 TagSearch_TreeView.cpp)
 target_link_libraries(TagSearch_TreeView PRIVATE TagSearchCore comctl32 shlwapi)
 
 add_executable(TagSearch_Caption WIN32 TagSearch_Caption.cpp)
-target_link_libraries(TagSearch_Caption PRIVATE TagSearchCore dwmapi)
+target_link_libraries(TagSearch_Caption PRIVATE TagSearchCore)
 
 if(MSVC)
     target_compile_options(TagSearchCore PRIVATE /utf-8)

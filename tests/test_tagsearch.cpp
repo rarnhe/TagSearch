@@ -25,7 +25,7 @@
 
 namespace tagsearch {
 HBITMAP CreateCaptionBitmap(HDC dc, SIZE size, const std::wstring& label,
-                            HFONT font, COLORREF color, LONG padding);
+                            HFONT font, COLORREF color, COLORREF accent, UINT dpi);
 std::span<const std::filesystem::path> CaptionNoticeIconFolders(
     std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments);
 HICON CreateCaptionNoticeTransportIcon();
@@ -569,9 +569,10 @@ void CaptionBitmapPreservesBackgroundAndRevealsGlyphs() {
     constexpr LONG padding = 4;
     const SIZE size{boldExtent.cx + 2 * padding, boldExtent.cy + 8};
 
-    const auto inspect = [&](HFONT font, COLORREF color) {
-        const Bitmap bitmap{tagsearch::CreateCaptionBitmap(dc.get(), size, label, font, color, padding),
-                            &DeleteObject};
+    constexpr COLORREF accent = RGB(35, 103, 201);
+    const auto render = [&](HFONT font, COLORREF color, const std::wstring& text) {
+        const Bitmap bitmap{tagsearch::CreateCaptionBitmap(dc.get(), size, text, font, color,
+                                                          accent, USER_DEFAULT_SCREEN_DPI), &DeleteObject};
         if (!bitmap) throw std::runtime_error("the renderer should create a caption bitmap");
         DIBSECTION info{};
         if (GetObjectW(bitmap.get(), sizeof(info), &info) != sizeof(info) || !info.dsBm.bmBits) {
@@ -579,22 +580,39 @@ void CaptionBitmapPreservesBackgroundAndRevealsGlyphs() {
         }
         const std::span pixels(static_cast<const DWORD*>(info.dsBm.bmBits),
                                static_cast<std::size_t>(size.cx) * size.cy);
+        return std::vector<DWORD>(pixels.begin(), pixels.end());
+    };
+    const auto inspect = [&](HFONT font, COLORREF color) {
+        const auto frame = render(font, color, L"");
+        const auto pixels = render(font, color, label);
+        const auto width = static_cast<std::size_t>(size.cx);
+        const auto middle = width / 2;
+        constexpr DWORD edge = 0xff2367c9;
+        Expect(frame.front() == 0 && frame[width - 1] == 0 &&
+               frame[frame.size() - width] == 0 && frame.back() == 0,
+               "the four outside corners should be transparent");
+        Expect(frame[middle] == edge && frame[frame.size() - width + middle] == edge,
+               "the rounded outline should use the accent color");
         const DWORD background = 0xff000000 | (GetRValue(color) << 16) | (GetGValue(color) << 8) | GetBValue(color);
-        Expect(pixels.front() == background, "the operator background should be opaque");
-        Expect(std::any_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 1; }),
-               "the center of a glyph should reveal the desktop");
-        Expect(std::none_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 0; }),
-               "glyph pixels should remain hit-testable");
+        Expect(frame[width + middle] == background, "the operator background should stay opaque inside the border");
+
         LONG left = size.cx;
         LONG right = 0;
+        std::size_t glyphCount = 0;
+        bool hasClearGlyph = false;
         for (std::size_t i = 0; i < pixels.size(); ++i) {
-            if (pixels[i] == background) continue;
-            const LONG x = static_cast<LONG>(i % size.cx);
+            if (pixels[i] == frame[i]) continue;
+            const DWORD alpha = pixels[i] >> 24;
+            Expect(alpha > 0, "glyph pixels should remain hit-testable");
+            hasClearGlyph |= alpha == 1;
+            ++glyphCount;
+            const LONG x = static_cast<LONG>(i % width);
             left = std::min(left, x);
             right = std::max(right, x + 1);
         }
+        Expect(hasClearGlyph, "the center of a glyph should reveal the desktop");
         Expect(left <= 8 && size.cx - right <= 8, "the caption should keep small side margins");
-        return std::count_if(pixels.begin(), pixels.end(), [=](DWORD pixel) { return pixel != background; });
+        return glyphCount;
     };
 
     constexpr COLORREF green = RGB(190, 235, 199);

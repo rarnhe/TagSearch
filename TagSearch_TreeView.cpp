@@ -1,6 +1,7 @@
 #include "TagSearch_Core.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <propkey.h>
 #include <propvarutil.h>
 #include <shlobj.h>
@@ -271,6 +272,11 @@ void ScanOnStartup(HWND window, StartupScan& scan, std::promise<std::wstring>& t
     if (!stop.stop_requested()) PostMessageW(window, kScanComplete, 0, 0);
 }
 
+void ApplyAccentBorder(HWND window) {
+    const COLORREF color = WindowAccentColor();
+    DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &color, sizeof(color));
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_NCCREATE) {
         const auto create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
@@ -289,7 +295,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (!state->tree || !SetWindowSubclass(state->tree, TreeMouseProc, 0, 0)) return -1;
         UpdateFont(window, *state);
         LayoutTree(window, *state);
-
+        ApplyAccentBorder(window);
         return 0;
     }
     case kFoldersResolved:
@@ -345,6 +351,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         break;
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETWORKAREA) UpdateDock(window, *state, GetDpiForWindow(window));
+        [[fallthrough]];
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+        ApplyAccentBorder(window);
         break;
     case WM_KEYDOWN:
         if (wParam == VK_TAB || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_HOME ||
