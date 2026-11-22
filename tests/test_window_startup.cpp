@@ -318,8 +318,9 @@ void CheckCaptionFrame(HWND window, const RECT& bounds) {
     Expect((style & (nativeStyle | extraStyles)) == nativeStyle,
            "a tag should use only the native popup caption style");
     const auto extended = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
-    Expect((extended & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) == WS_EX_TOOLWINDOW,
-           "a tag should be a native tool window without a layered surface");
+    constexpr DWORD popupStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    Expect((extended & popupStyle) == popupStyle && !(extended & WS_EX_TRANSPARENT),
+           "a tag should have a layered tool window surface and remain clickable");
     RECT client{};
     Expect(GetClientRect(window, &client) && client.right == bounds.right - bounds.left &&
            client.bottom == bounds.bottom - bounds.top,
@@ -370,7 +371,6 @@ std::vector<DWORD> PrintCaption(HWND window) {
     DeleteObject(bitmap);
     DeleteDC(dc);
     Expect(printed, "PrintWindow should render the title onto the bitmap");
-    for (auto& pixel : pixels) pixel &= 0x00ffffff;
     return pixels;
 }
 
@@ -381,13 +381,12 @@ void CheckCaptionPaint(HWND window) {
                "the caption should handle the test input");
     };
     const auto checkColors = [](const std::vector<DWORD>& pixels, DWORD background) {
-        Expect(pixels.front() == background, "the caption should paint the PR #8 operator background");
-        Expect(std::any_of(pixels.begin(), pixels.end(), [=](DWORD pixel) {
-            return pixel != background &&
-                (pixel & 0xff0000) >= (background & 0xff0000) &&
-                (pixel & 0x00ff00) >= (background & 0x00ff00) &&
-                (pixel & 0x0000ff) >= (background & 0x0000ff);
-        }), "the title should use white text over the operator background");
+        Expect(pixels.front() == (0xff000000 | background),
+               "the operator background should use the opaque PR #8 color");
+        Expect(std::any_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 1; }),
+               "the center of a glyph should reveal the desktop while retaining hit testing");
+        Expect(std::none_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 0; }),
+               "the title should be clickable through its glyphs");
     };
 
     constexpr UINT setTagMode = WM_APP + 5;
@@ -398,13 +397,31 @@ void CheckCaptionPaint(HWND window) {
     }
 
     send(setTagMode, 1);
-    const auto normal = PrintCaption(window);
+    const auto bold = PrintCaption(window);
+    RECT client{};
+    Expect(GetClientRect(window, &client) && client.right > 0, "the caption should have a width");
+    LONG left = client.right;
+    LONG right = 0;
+    for (std::size_t i = 0; i < bold.size(); ++i) {
+        if ((bold[i] >> 24) == 255) continue;
+        const LONG x = static_cast<LONG>(i % client.right);
+        left = std::min(left, x);
+        right = std::max(right, x + 1);
+    }
+    const LONG maxPadding = MulDiv(8, GetDpiForWindow(window), USER_DEFAULT_SCREEN_DPI);
+    Expect(left <= maxPadding && client.right - right <= maxPadding,
+           "the caption should fit its title with small side margins");
+
     send(WM_NCLBUTTONDOWN, HTCAPTION);
     const auto pressed = PrintCaption(window);
     checkColors(pressed, backgrounds[0]);
-    Expect(pressed != normal, "pressing the label should repaint it in bold over the same background");
+    const auto glyphPixels = [](const std::vector<DWORD>& pixels) {
+        return std::count_if(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) < 255; });
+    };
+    Expect(glyphPixels(bold) > glyphPixels(pressed),
+           "pressing the bold label should switch to the lighter font weight");
     send(WM_CANCELMODE);
-    Expect(PrintCaption(window) == normal, "canceling the press should restore the regular title");
+    Expect(PrintCaption(window) == bold, "canceling the press should restore the bold title");
 }
 
 bool HasIntersection(const std::vector<RECT>& bounds) {

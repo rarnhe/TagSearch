@@ -254,8 +254,8 @@ constexpr UINT kSetTagMode = WM_APP + 5;
 constexpr UINT kScanStarted = WM_APP + 6;
 constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
-constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW;
-constexpr int kTitlePadding = 6;
+constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+constexpr int kTitlePadding = 4;
 using tagsearch::TagOperator;
 
 struct TagMode {
@@ -409,31 +409,66 @@ HFONT CreateCaptionFont(UINT dpi, bool bold) {
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)) return nullptr;
     metrics.lfSmCaptionFont.lfWeight = bold ? FW_BOLD : FW_NORMAL;
+    metrics.lfSmCaptionFont.lfQuality = ANTIALIASED_QUALITY;
     return CreateFontIndirectW(&metrics.lfSmCaptionFont);
 }
 
-void PaintCaption(HWND window, HDC dc, const FloatingTag& tag) {
-    RECT caption{};
-    if (!GetClientRect(window, &caption) || IsRectEmpty(&caption)) return;
+bool PaintCaption(HWND window, const FloatingTag& tag, const RECT& bounds, HDC printTarget = nullptr) {
+    SIZE size{bounds.right - bounds.left, bounds.bottom - bounds.top};
+    if (size.cx <= 0 || size.cy <= 0) return false;
 
-    const COLORREF background = kTagModes[static_cast<std::size_t>(tag.operation)].color;
-    SetBkColor(dc, background);
-    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &caption, L"", 0, nullptr);
+    using Bitmap = std::unique_ptr<std::remove_pointer_t<HBITMAP>, decltype(&DeleteObject)>;
+    using MemoryDc = std::unique_ptr<std::remove_pointer_t<HDC>, decltype(&DeleteDC)>;
+    Bitmap bitmap{nullptr, &DeleteObject};
+    const MemoryDc dc{CreateCompatibleDC(nullptr), &DeleteDC};
+    if (!dc) return false;
 
-    const auto& font = tag.pressed ? tag.caption.boldTitleFont : tag.caption.titleFont;
-    const auto previousFont = font ? SelectObject(dc, font.get()) : nullptr;
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    const int padding = Scale(kTitlePadding, WindowDpi(window));
-    caption.left += padding;
-    caption.right -= padding;
-    DrawTextW(dc, tag.text.c_str(), -1, &caption,
+    BITMAPINFO image{};
+    image.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    image.bmiHeader.biWidth = size.cx;
+    image.bmiHeader.biHeight = -size.cy;
+    image.bmiHeader.biPlanes = 1;
+    image.bmiHeader.biBitCount = 32;
+    image.bmiHeader.biCompression = BI_RGB;
+    void* data = nullptr;
+    bitmap.reset(CreateDIBSection(dc.get(), &image, DIB_RGB_COLORS, &data, nullptr, 0));
+    if (!bitmap || !data || !SelectObject(dc.get(), bitmap.get())) return false;
+
+    // Rasterize the title into a grayscale mask. White glyph coverage removes
+    // the mode color, exposing whatever is behind the label.
+    PatBlt(dc.get(), 0, 0, size.cx, size.cy, BLACKNESS);
+    const auto& font = tag.pressed ? tag.caption.titleFont : tag.caption.boldTitleFont;
+    if (font) SelectObject(dc.get(), font.get());
+    SetBkMode(dc.get(), TRANSPARENT);
+    SetTextColor(dc.get(), RGB(255, 255, 255));
+    const LONG padding = Scale(kTitlePadding, WindowDpi(window));
+    RECT text{padding, 0, std::max(padding, size.cx - padding), size.cy};
+    DrawTextW(dc.get(), tag.text.c_str(), -1, &text,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-    if (previousFont) SelectObject(dc, previousFont);
+    GdiFlush();
+
+    const COLORREF color = kTagModes[static_cast<std::size_t>(tag.operation)].color;
+    const auto count = static_cast<std::size_t>(size.cx) * size.cy;
+    for (auto& pixel : std::span(static_cast<DWORD*>(data), count)) {
+        // Zero-alpha pixels let mouse clicks pass through layered windows.
+        const DWORD alpha = std::max<DWORD>(1, 255 - (pixel & 0xff));
+        const DWORD red = (GetRValue(color) * alpha + 127) / 255;
+        const DWORD green = (GetGValue(color) * alpha + 127) / 255;
+        const DWORD blue = (GetBValue(color) * alpha + 127) / 255;
+        pixel = (alpha << 24) | (red << 16) | (green << 8) | blue;
+    }
+
+    if (printTarget) return BitBlt(printTarget, 0, 0, size.cx, size.cy, dc.get(), 0, 0, SRCCOPY) != FALSE;
+
+    POINT origin{bounds.left, bounds.top};
+    POINT source{};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    return UpdateLayeredWindow(window, nullptr, &origin, &size, dc.get(), &source, 0, &blend, ULW_ALPHA) != FALSE;
 }
 
-void RedrawCaption(HWND window) {
-    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+void RedrawCaption(HWND window, const FloatingTag& tag) {
+    RECT bounds{};
+    if (GetWindowRect(window, &bounds)) PaintCaption(window, tag, bounds);
 }
 
 std::vector<tagsearch::TagWindowBounds> VisibleTagsInZOrder(const Caption& caption) {
@@ -703,7 +738,6 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
 
     switch (message) {
     case WM_CREATE: {
-        // Keep a DWM frame around the title, whose colors and font are painted in the client area.
         constexpr MARGINS frame{1, 1, 1, 1};
         DwmExtendFrameIntoClientArea(window, &frame);
         return 0;
@@ -715,16 +749,13 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         const auto hit = DefWindowProcW(window, message, wParam, lParam);
         return hit == HTCLIENT ? HTCAPTION : hit;
     }
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        const HDC dc = BeginPaint(window, &paint);
-        if (dc) PaintCaption(window, dc, *tag);
-        EndPaint(window, &paint);
+    case WM_PRINTCLIENT: {
+        RECT bounds{};
+        if (wParam && GetWindowRect(window, &bounds)) {
+            PaintCaption(window, *tag, bounds, reinterpret_cast<HDC>(wParam));
+        }
         return 0;
     }
-    case WM_PRINTCLIENT:
-        if (wParam) PaintCaption(window, reinterpret_cast<HDC>(wParam), *tag);
-        return 0;
     case WM_MOUSEACTIVATE:
         // Mouse activation can raise a lower window before the click is dispatched.
         if (LOWORD(lParam) == HTCAPTION &&
@@ -742,7 +773,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             tag->moved = false;
             SetCapture(window);
             tag->pressed = GetCapture() == window;
-            if (tag->pressed) RedrawCaption(window);
+            if (tag->pressed) RedrawCaption(window, *tag);
             else tag->clickTerms.clear();
         }
         return 0;
@@ -778,7 +809,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             auto terms = std::move(tag->clickTerms);
             tag->pressed = false;
             ReleaseCapture();
-            RedrawCaption(window);
+            RedrawCaption(window, *tag);
             if (clicked) ActivateTag(window, *tag, std::move(terms));
             if (moved) UpdateOverlapNotice(tag->caption);
             return 0;
@@ -789,7 +820,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         tag->dragging = false;
         tag->moved = false;
         tag->clickTerms.clear();
-        if (wasPressed) RedrawCaption(window);
+        if (wasPressed) RedrawCaption(window, *tag);
         return 0;
     }
     case WM_KEYDOWN:
@@ -809,7 +840,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case kSetTagMode:
         if (wParam > 0 && wParam <= std::size(kTagModes)) {
             tag->operation = kTagModes[wParam - 1].operation;
-            RedrawCaption(window);
+            RedrawCaption(window, *tag);
         }
         return 0;
     case WM_CLOSE:
@@ -844,7 +875,6 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
     const auto oldFont = dc && font ? SelectObject(dc, font) : nullptr;
     std::vector<LONG> widths;
     widths.reserve(caption.tags.size());
-    const LONG frameWidth = frame.right - frame.left;
     for (const auto& tag : caption.tags) {
         SIZE text{};
         if (dc) GetTextExtentPoint32W(dc, tag->text.c_str(), static_cast<int>(tag->text.size()), &text);
@@ -861,8 +891,8 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
         }
         if (previousFont) SelectObject(dc, previousFont);
     }
-    const LONG chrome = frameWidth + 2 * Scale(kTitlePadding, dpi);
-    for (auto& width : widths) width += chrome;
+    const LONG padding = Scale(kTitlePadding, dpi);
+    for (auto& width : widths) width += 2 * padding;
     if (dc) {
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(caption.controller, dc);
@@ -872,13 +902,11 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
     const LONG height = frame.bottom - frame.top;
     tagsearch::LayoutCaptionWindows(work, widths, height, bounds, caption.random);
     // On first display, place and show each tag without requesting foreground activation.
-    const UINT flags = SWP_NOACTIVATE | (firstShow ? SWP_SHOWWINDOW | SWP_NOOWNERZORDER : SWP_NOZORDER);
     for (std::size_t i = 0; i < bounds.size(); ++i) {
-        const auto& rect = bounds[i];
-        if (!SetWindowPos(caption.tags[i]->window, firstShow ? HWND_TOP : nullptr, rect.left, rect.top,
-                          rect.right - rect.left, rect.bottom - rect.top, flags)) {
-            return false;
-        }
+        const auto& tag = *caption.tags[i];
+        if (!PaintCaption(tag.window, tag, bounds[i])) return false;
+        if (firstShow && !SetWindowPos(tag.window, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE |
+                                      SWP_SHOWWINDOW | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE)) return false;
     }
     return true;
 }
