@@ -237,6 +237,37 @@ void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
     ClosePanel(panel, process);
 }
 
+void CheckTreeCache(const fs::path& executable, const fs::path& fixture) {
+    const TestCopy copy(executable);
+    const auto image = copy.directory / L"tagged.jpg";
+    const auto ini = copy.directory / L"desktop.ini";
+    fs::copy_file(fixture, image);
+
+    const auto countTags = [&](const Process& process) {
+        const HWND panel = WaitForPanel(process);
+        WaitForTitle(panel, copy.directory.filename().wstring());
+        const HWND tree = FindWindowExW(panel, nullptr, WC_TREEVIEWW, nullptr);
+        if (!tree) throw std::runtime_error("the panel should contain a tree view");
+        const auto count = SendMessageW(tree, TVM_GETCOUNT, 0, 0);
+        ClosePanel(panel, process);
+        return count;
+    };
+
+    const Process cold(copy.executable, {copy.directory});
+    const auto count = countTags(cold);
+    Expect(count >= 2, "the cold TreeView launch should show the fixture tags");
+    std::array<wchar_t, 256> keywords{};
+    GetPrivateProfileStringW(L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}", L"Prop5", L"",
+                             keywords.data(), static_cast<DWORD>(keywords.size()), ini.c_str());
+    const std::wstring_view value(keywords.data());
+    Expect(value.starts_with(L"31,") && value.find(L"项目 & 资料") != std::wstring_view::npos,
+           "TreeView should write the requested directory's Unicode tag cache");
+
+    fs::remove(image);
+    const Process warm(copy.executable, {copy.directory});
+    Expect(countTags(warm) == count, "TreeView should recover the same rows from desktop.ini on next launch");
+}
+
 struct VisibleTags {
     HWND controller;
     bool unexpectedVisibleWindow = false;
@@ -435,6 +466,8 @@ int wmain(int argc, wchar_t** argv) {
             CheckFixedWindowAndTitle(argv[2]);
         } else if (mode == L"treeview-blank-click" && argc == 4) {
             CheckTreeBlankClick(argv[2], argv[3]);
+        } else if (mode == L"treeview-cache" && argc == 4) {
+            CheckTreeCache(argv[2], argv[3]);
         } else if (mode == L"caption" && argc == 4) {
             CheckCaptionLayout(argv[2], argv[3]);
         } else if (mode == L"caption-crowded" && argc == 4) {

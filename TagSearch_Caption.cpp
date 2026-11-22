@@ -317,6 +317,8 @@ constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
 constexpr UINT kNoticeEvent = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
+constexpr UINT_PTR kClickFlashTimer = 1;
+constexpr UINT kClickFlashMs = 180;
 constexpr UINT kScanStarted = WM_APP + 6;
 constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
@@ -467,12 +469,27 @@ RECT PrimaryWorkArea() {
     return monitor.rcWork;
 }
 
-void ApplyTagColor(HWND window, TagOperator operation) {
+bool HighContrastEnabled() {
     HIGHCONTRASTW contrast{sizeof(contrast)};
-    const bool highContrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
-                              (contrast.dwFlags & HCF_HIGHCONTRASTON);
-    const COLORREF color = highContrast ? DWMWA_COLOR_DEFAULT : kTagModes[static_cast<std::size_t>(operation)].color;
+    return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+           (contrast.dwFlags & HCF_HIGHCONTRASTON);
+}
+
+void ApplyTagColor(HWND window, TagOperator operation) {
+    const COLORREF color = HighContrastEnabled()
+        ? DWMWA_COLOR_DEFAULT : kTagModes[static_cast<std::size_t>(operation)].color;
     DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &color, sizeof(color));
+}
+
+void FlashClickedTag(HWND window) {
+    // A fixed DWM caption color can mask the native active/inactive flash.
+    if (!HighContrastEnabled() && SetTimer(window, kClickFlashTimer, kClickFlashMs, nullptr)) {
+        constexpr COLORREF highlight = RGB(255, 219, 130);
+        if (SUCCEEDED(DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &highlight, sizeof(highlight)))) return;
+        KillTimer(window, kClickFlashTimer);
+    }
+    FLASHWINFO flash{sizeof(flash), window, FLASHW_CAPTION, 1, kClickFlashMs};
+    FlashWindowEx(&flash);
 }
 
 std::vector<tagsearch::TagWindowBounds> VisibleTagsInZOrder(const Caption& caption) {
@@ -798,7 +815,10 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             auto terms = std::move(tag->clickTerms);
             tag->pressed = false;
             ReleaseCapture();
-            if (clicked) ActivateTag(window, *tag, std::move(terms));
+            if (clicked) {
+                FlashClickedTag(window);
+                ActivateTag(window, *tag, std::move(terms));
+            }
             if (moved) UpdateOverlapNotice(tag->caption);
             return 0;
         }
@@ -808,6 +828,11 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         tag->dragging = false;
         tag->moved = false;
         tag->clickTerms.clear();
+        return 0;
+    case WM_TIMER:
+        if (wParam != kClickFlashTimer) break;
+        KillTimer(window, kClickFlashTimer);
+        ApplyTagColor(window, tag->operation);
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
@@ -921,7 +946,7 @@ void ScanInBackground(Caption& caption, std::promise<ScanNoticeData>& notice, st
                 if (!hasFolderArguments) displayFolders.assign(iconFolders.begin(), iconFolders.end());
                 notice.set_value({std::move(displayFolders), LoadNoticeIcons(iconFolders, stop)});
                 PostMessageW(caption.controller, kScanStarted, 0, 0);
-                scan.tags = tagsearch::ScanCaptionTags(scan.folders, defaultCount, stop);
+                scan.tags = tagsearch::ScanTagsWithDesktopIniCache(scan.folders, defaultCount, stop);
                 scan.success = !stop.stop_requested();
             }
         } catch (...) {

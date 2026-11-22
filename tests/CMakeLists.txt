@@ -20,9 +20,9 @@ set(cases
     resolve_folders_keeps_known_folders
     resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs
     scan_tags_reads_nested_shell_properties_without_using_cache
-    caption_caches_requested_folders_independently
-    caption_scans_default_roots_live_and_repairs_invalid_cache
-    caption_combines_warm_and_cold_nested_folders
+    tag_cache_stores_requested_folders_independently
+    tag_cache_scans_default_roots_live_and_repairs_invalid_cache
+    tag_cache_combines_warm_and_cold_nested_folders
     create_search_folder_accepts_multiple_scopes_and_literal_tag
     create_search_folder_rejects_empty_scope
     overlap_finds_all_direct_intersections
@@ -58,6 +58,9 @@ add_test(NAME treeview_fixed_window_and_folder_title
 add_test(NAME treeview_blank_click_preserves_selection
          COMMAND tagsearch_window_startup_test treeview-blank-click $<TARGET_FILE:TagSearch_TreeView>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
+add_test(NAME treeview_creates_and_reuses_desktop_ini
+         COMMAND tagsearch_window_startup_test treeview-cache $<TARGET_FILE:TagSearch_TreeView>
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 add_test(NAME caption_background_scan_and_native_tag_windows
          COMMAND tagsearch_window_startup_test caption $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
@@ -65,6 +68,6 @@ add_test(NAME caption_crowded_tags_are_all_visible
          COMMAND tagsearch_window_startup_test caption-crowded $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
-                     treeview_blank_click_preserves_selection
+                     treeview_blank_click_preserves_selection treeview_creates_and_reuses_desktop_ini
                      caption_background_scan_and_native_tag_windows caption_crowded_tags_are_all_visible
                      PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)

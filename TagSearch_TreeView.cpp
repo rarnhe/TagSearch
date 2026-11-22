@@ -265,7 +265,7 @@ void ScanOnStartup(HWND window, StartupScan& scan, std::promise<std::wstring>& t
             if (!stop.stop_requested()) {
                 title.set_value(FolderTitle(scan.folders, defaultCount));
                 PostMessageW(window, kFoldersResolved, 0, 0);
-                scan.tags = ScanTags(scan.folders, stop);
+                scan.tags = ScanTagsWithDesktopIniCache(scan.folders, defaultCount, stop);
                 scan.succeeded = !stop.stop_requested();
                 if (scan.succeeded) RegisterAppShortcut();
             }

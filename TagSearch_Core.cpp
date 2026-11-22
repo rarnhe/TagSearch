@@ -288,6 +288,7 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const Keyw
     }
 
     auto text = original.text;
+    if (text.empty()) text = L"[.ShellClassInfo]\r\nInfoTip=\r\nIconResource=\r\n";
     auto position = entry.position;
     if (position == std::wstring_view::npos) {
         if (!text.empty() && text.back() != L'\n' && text.back() != L'\r') text += L"\r\n";
@@ -404,7 +405,7 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
     return ScanTagsWithSnapshots(folders, {}, stop);
 }
 
-Tags ScanCaptionTags(const Folders& folders, std::size_t defaultCount, std::stop_token stop) {
+Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop) {
     const auto requestedFolders = std::span(folders).subspan(defaultCount);
     Folders ordered(requestedFolders.begin(), requestedFolders.end());
     // Resolve children first so a parent scan can reuse any explicitly requested child snapshot.

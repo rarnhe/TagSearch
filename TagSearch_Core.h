@@ -46,7 +46,7 @@ Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCou
 // Call Shell operations from a thread with COM initialized.
 Tags ScanTags(const Folders& folders, std::stop_token stop = {});
 // The first defaultCount roots are scanned live; remaining roots may use desktop.ini snapshots.
-Tags ScanCaptionTags(const Folders& folders, std::size_t defaultCount, std::stop_token stop = {});
+Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop = {});
 HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result);
 HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result);
 HRESULT CreateTagQueryCondition(std::span<const TagSearchTerm> terms, ICondition** result);

@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <shellapi.h>
 #include <stdexcept>
@@ -176,7 +177,7 @@ std::wstring IniValue(const fs::path& ini, const wchar_t* section, const wchar_t
 
 constexpr wchar_t summarySection[] = L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}";
 
-void CaptionCachesRequestedFoldersIndependently() {
+void CachesRequestedFoldersIndependently() {
     TestDirectory test;
     const auto first = test.path / L"Folder A";
     const auto second = test.path / L"Folder B";
@@ -193,14 +194,21 @@ void CaptionCachesRequestedFoldersIndependently() {
 
     const tagsearch::Folders folders{test.path, first, second};
     const auto expected = tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"});
-    ExpectEqual(tagsearch::ScanCaptionTags(folders, 1), expected,
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), expected,
                 "a cold scan should merge deduplicated tags from requested directories");
     const auto firstKeywords = IniValue(firstIni, summarySection, L"Prop5");
     Expect(firstKeywords.starts_with(L"31,"), "the first directory should store a summary value");
     ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(firstKeywords).substr(3))),
                 expected, "the first directory should store its own Unicode tag list");
-    ExpectEqual(IniValue(secondIni, summarySection, L"Prop5"), std::wstring(L"31,"),
-                "a directory without tags should store an empty cache");
+    {
+        std::ifstream ini(secondIni, std::ios::binary);
+        const std::string contents(std::istreambuf_iterator<char>{ini}, std::istreambuf_iterator<char>{});
+        const std::wstring expectedIni = L"\ufeff[.ShellClassInfo]\r\nInfoTip=\r\nIconResource=\r\n"
+            L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,\r\n";
+        ExpectEqual(contents, std::string(reinterpret_cast<const char*>(expectedIni.data()),
+                                         expectedIni.size() * sizeof(wchar_t)),
+                    "a new desktop.ini should use the shell template and store an empty tag list");
+    }
     ExpectEqual(IniValue(firstIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
                 "writing the cache should preserve custom folder icons");
     ExpectEqual(IniValue(firstIni, summarySection, L"Prop2"), std::wstring(L"31,Folder title"),
@@ -212,15 +220,15 @@ void CaptionCachesRequestedFoldersIndependently() {
     fs::remove_all(first / L"nested");
     fs::remove(first / L"duplicate.jpg");
     fs::copy_file(fixturePath, second / L"new.jpg");
-    ExpectEqual(tagsearch::ScanCaptionTags(folders, 1), expected,
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), expected,
                 "a warm run should reuse the stored snapshot after the original files are removed");
 
     fs::remove(firstIni);
-    Expect(tagsearch::ScanCaptionTags(folders, 1).empty(),
+    Expect(tagsearch::ScanTagsWithDesktopIniCache(folders, 1).empty(),
            "an empty cache should skip newly added files even when an implicit root contains it");
 }
 
-void CaptionScansDefaultRootsLiveAndRepairsInvalidCache() {
+void ScansDefaultRootsLiveAndRepairsInvalidCache() {
     TestDirectory test;
     const auto desktop = test.path / L"Desktop";
     const auto downloads = test.path / L"Downloads";
@@ -243,7 +251,7 @@ void CaptionScansDefaultRootsLiveAndRepairsInvalidCache() {
            "the default desktop fixture should provide a live file tag");
     expected.push_back(L"cached A");
     const tagsearch::Folders folders{desktop, downloads, first, second};
-    ExpectEqual(tagsearch::ScanCaptionTags(folders, 2), tagsearch::NormalizeTags(std::move(expected)),
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 2), tagsearch::NormalizeTags(std::move(expected)),
                 "default live tags and explicit cached tags should be combined and deduplicated");
     ExpectEqual(IniValue(desktopIni, summarySection, L"Prop5"), std::wstring(L"31,desktop value"),
                 "an existing default desktop.ini should be left alone");
@@ -254,7 +262,7 @@ void CaptionScansDefaultRootsLiveAndRepairsInvalidCache() {
                 "repairing an invalid cache should preserve the custom icon");
 }
 
-void CaptionCombinesWarmAndColdNestedFolders() {
+void CombinesWarmAndColdNestedFolders() {
     TestDirectory test;
     const auto child = test.path / L"Child";
     fs::create_directory(child);
@@ -263,7 +271,7 @@ void CaptionCombinesWarmAndColdNestedFolders() {
                               "Prop5 = 31, cached ;cached; child\n";
     fs::copy_file(fixturePath, child / L"live-only.jpg");
     const auto expected = tagsearch::NormalizeTags({L"cached", L"child"});
-    ExpectEqual(tagsearch::ScanCaptionTags({test.path, child}, 0), expected,
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({test.path, child}, 0), expected,
                 "a cold parent should reuse a requested child's valid cache without rescanning the child");
     const auto parentKeywords = IniValue(test.path / L"desktop.ini", summarySection, L"Prop5");
     Expect(parentKeywords.starts_with(L"31,"), "the parent should store its own summary value");
@@ -658,9 +666,9 @@ int main(int argc, char** argv) {
         {"resolve_folders_keeps_known_folders", ResolveFoldersKeepsKnownFolders},
         {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
         {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
-        {"caption_caches_requested_folders_independently", CaptionCachesRequestedFoldersIndependently},
-        {"caption_scans_default_roots_live_and_repairs_invalid_cache", CaptionScansDefaultRootsLiveAndRepairsInvalidCache},
-        {"caption_combines_warm_and_cold_nested_folders", CaptionCombinesWarmAndColdNestedFolders},
+        {"tag_cache_stores_requested_folders_independently", CachesRequestedFoldersIndependently},
+        {"tag_cache_scans_default_roots_live_and_repairs_invalid_cache", ScansDefaultRootsLiveAndRepairsInvalidCache},
+        {"tag_cache_combines_warm_and_cold_nested_folders", CombinesWarmAndColdNestedFolders},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
         {"overlap_finds_all_direct_intersections", OverlapFindsAllDirectIntersections},
