@@ -206,7 +206,7 @@ void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
     const HWND panel = WaitForPanel(process);
     WaitForTitle(panel, copy.directory.filename().wstring());
     const HWND tree = FindWindowExW(panel, nullptr, WC_TREEVIEWW, nullptr);
-    Expect(tree != nullptr, "the panel should contain a tree view");
+    if (!tree) throw std::runtime_error("the panel should contain a tree view");
 
     RECT client{};
     const auto count = SendMessageW(tree, TVM_GETCOUNT, 0, 0);
