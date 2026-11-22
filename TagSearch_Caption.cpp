@@ -1,5 +1,7 @@
 #include "TagSearch_Core.h"
 
+#include <shellapi.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cwchar>
@@ -206,12 +208,24 @@ std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(con
     return std::pair{(folder / expanded).lexically_normal(), index};
 }
 
+void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon) {
+    notice.hIcon = icon;
+    notice.hBalloonIcon = icon;
+    notice.dwInfoFlags = icon ? NIIF_USER : NIIF_NONE;
+    if (icon) notice.uFlags |= NIF_ICON;
+    else notice.uFlags &= ~NIF_ICON;
+
+    // Use the same resource for the sender window and the notification, including the empty state.
+    const auto iconHandle = reinterpret_cast<LPARAM>(icon);
+    SendMessageW(notice.hWnd, WM_SETICON, ICON_SMALL, iconHandle);
+    SendMessageW(notice.hWnd, WM_SETICON, ICON_BIG, iconHandle);
+}
+
 } // namespace tagsearch
 
 #ifndef TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
 
 #include <dwmapi.h>
-#include <shellapi.h>
 #include <windowsx.h>
 #include <future>
 #include <iterator>
@@ -501,22 +515,20 @@ void ShowNotice(Caption& caption, UINT& icon, const std::wstring& title, std::ws
     // A queued callback from an older balloon must not dismiss a newer one.
     caption.lastNoticeIcon = caption.lastNoticeIcon % 0xffff + 1;
     notice.uID = caption.lastNoticeIcon;
-    notice.uFlags = NIF_ICON | NIF_MESSAGE;
+    notice.uFlags = NIF_MESSAGE;
     notice.uCallbackMessage = kNoticeEvent;
     HICON iconForNotice = nullptr;
     if (!caption.noticeIcons.empty()) {
         const auto offset = std::uniform_int_distribution<std::size_t>(0, caption.noticeIcons.size() - 1)(caption.random);
         iconForNotice = std::next(caption.noticeIcons.begin(), static_cast<std::ptrdiff_t>(offset))->second.get();
     }
-    notice.hIcon = iconForNotice ? iconForNotice : LoadIconW(nullptr, IDI_APPLICATION);
+    tagsearch::ConfigureCaptionNoticeIcon(notice, iconForNotice);
     if (!Shell_NotifyIconW(NIM_ADD, &notice)) return;
 
     icon = notice.uID;
     notice.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &notice);
     notice.uFlags = NIF_INFO;
-    notice.dwInfoFlags = iconForNotice ? NIIF_USER : NIIF_INFO;
-    notice.hBalloonIcon = iconForNotice;
     wcscpy_s(notice.szInfoTitle, title.c_str());
     wcscpy_s(notice.szInfo, body.c_str());
     if (!Shell_NotifyIconW(NIM_MODIFY, &notice) ||

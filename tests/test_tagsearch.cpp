@@ -21,6 +21,7 @@
 
 namespace tagsearch {
 std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder);
+void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon);
 }
 
 namespace {
@@ -332,6 +333,34 @@ void CaptionReadsLegacyDesktopIniIcon() {
     Expect(extracted, "the returned location should load as a Win32 notification icon");
 }
 
+void CaptionNoticeMatchesSenderIconOrHasNone() {
+    const HICON icon = LoadIconW(nullptr, IDI_APPLICATION);
+    if (!icon) throw std::runtime_error("the test should load an icon");
+    const HWND owner = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
+        0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!owner) throw std::runtime_error("the test should create a hidden notification owner");
+
+    NOTIFYICONDATAW notice{sizeof(notice)};
+    notice.hWnd = owner;
+    notice.uFlags = NIF_MESSAGE;
+    tagsearch::ConfigureCaptionNoticeIcon(notice, icon);
+    const auto iconHandle = reinterpret_cast<LRESULT>(icon);
+    const bool matched = (notice.uFlags & NIF_ICON) && notice.dwInfoFlags == NIIF_USER &&
+        notice.hIcon == icon && notice.hBalloonIcon == icon &&
+        SendMessageW(owner, WM_GETICON, ICON_SMALL, 0) == iconHandle &&
+        SendMessageW(owner, WM_GETICON, ICON_BIG, 0) == iconHandle;
+
+    tagsearch::ConfigureCaptionNoticeIcon(notice, nullptr);
+    const bool removed = notice.uFlags == NIF_MESSAGE && notice.dwInfoFlags == NIIF_NONE &&
+        !notice.hIcon && !notice.hBalloonIcon &&
+        SendMessageW(owner, WM_GETICON, ICON_SMALL, 0) == 0 &&
+        SendMessageW(owner, WM_GETICON, ICON_BIG, 0) == 0;
+    DestroyWindow(owner);
+
+    Expect(matched, "the tray, notification and owner window should use the same icon");
+    Expect(removed, "no icon should be submitted or left on the owner without a usable resource");
+}
+
 void CaptionLayoutPacksVariableWidths() {
     const RECT work{-200, 30, 0, 80};
     const std::array<LONG, 6> widths{120, 120, 50, 50, 30, 30};
@@ -466,6 +495,7 @@ int main(int argc, char** argv) {
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
         {"caption_reads_desktop_ini_icon_resource", CaptionReadsDesktopIniIconResource},
         {"caption_reads_legacy_desktop_ini_icon", CaptionReadsLegacyDesktopIniIcon},
+        {"caption_notice_matches_sender_icon_or_has_none", CaptionNoticeMatchesSenderIconOrHasNone},
         {"caption_layout_packs_variable_widths", CaptionLayoutPacksVariableWidths},
         {"caption_layout_keeps_all_crowded_windows_and_counts_overlap", CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap},
         {"caption_layout_randomizes_positions", CaptionLayoutRandomizesPositions},
