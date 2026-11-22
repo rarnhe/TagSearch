@@ -364,14 +364,16 @@ std::vector<DWORD> PrintCaption(HWND window) {
         throw std::runtime_error("the caption snapshot needs a bitmap");
     }
     const auto previous = SelectObject(dc, bitmap);
-    const bool printed = PrintWindow(window, dc, PW_CLIENTONLY) != FALSE;
+    DWORD_PTR result = 0;
+    const bool printed = SendMessageTimeoutW(window, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc),
+                                             PRF_CLIENT, SMTO_ABORTIFHUNG, 1000, &result) && result;
     GdiFlush();
     if (printed) std::memcpy(pixels.data(), data, pixels.size() * sizeof(DWORD));
     if (previous) SelectObject(dc, previous);
     DeleteObject(bitmap);
     DeleteDC(dc);
-    Expect(printed, "PrintWindow should render the title onto the bitmap");
-    // PrintWindow transfers the rendered RGB channels through GDI. The
+    Expect(printed, "the caption should draw into the supplied device context");
+    // GDI transfers the rendered RGB channels. The
     // premultiplied glyph color is near zero, even if GDI discards the alpha byte.
     for (auto& pixel : pixels) pixel &= 0x00ffffff;
     return pixels;

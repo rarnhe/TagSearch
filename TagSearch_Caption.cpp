@@ -751,10 +751,8 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     }
     case WM_PRINTCLIENT: {
         RECT bounds{};
-        if (wParam && GetWindowRect(window, &bounds)) {
+        return wParam && GetWindowRect(window, &bounds) &&
             PaintCaption(window, *tag, bounds, reinterpret_cast<HDC>(wParam));
-        }
-        return 0;
     }
     case WM_MOUSEACTIVATE:
         // Mouse activation can raise a lower window before the click is dispatched.
