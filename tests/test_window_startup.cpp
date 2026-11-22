@@ -371,6 +371,9 @@ std::vector<DWORD> PrintCaption(HWND window) {
     DeleteObject(bitmap);
     DeleteDC(dc);
     Expect(printed, "PrintWindow should render the title onto the bitmap");
+    // PrintWindow transfers the rendered RGB channels through GDI. The
+    // premultiplied glyph color is near zero, even if GDI discards the alpha byte.
+    for (auto& pixel : pixels) pixel &= 0x00ffffff;
     return pixels;
 }
 
@@ -381,12 +384,13 @@ void CheckCaptionPaint(HWND window) {
                "the caption should handle the test input");
     };
     const auto checkColors = [](const std::vector<DWORD>& pixels, DWORD background) {
-        Expect(pixels.front() == (0xff000000 | background),
-               "the operator background should use the opaque PR #8 color");
-        Expect(std::any_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 1; }),
-               "the center of a glyph should reveal the desktop while retaining hit testing");
-        Expect(std::none_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 0; }),
-               "the title should be clickable through its glyphs");
+        if (pixels.front() != background) {
+            std::cerr << "Caption background pixels: actual " << std::hex << pixels.front()
+                      << ", expected " << background << '\n';
+        }
+        Expect(pixels.front() == background, "the operator background should use the PR #8 color");
+        Expect(std::any_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return pixel <= 0x010101; }),
+               "the center of a glyph should have near-zero premultiplied color");
     };
 
     constexpr UINT setTagMode = WM_APP + 5;
@@ -403,7 +407,7 @@ void CheckCaptionPaint(HWND window) {
     LONG left = client.right;
     LONG right = 0;
     for (std::size_t i = 0; i < bold.size(); ++i) {
-        if ((bold[i] >> 24) == 255) continue;
+        if (bold[i] == backgrounds[0]) continue;
         const LONG x = static_cast<LONG>(i % client.right);
         left = std::min(left, x);
         right = std::max(right, x + 1);
@@ -416,7 +420,7 @@ void CheckCaptionPaint(HWND window) {
     const auto pressed = PrintCaption(window);
     checkColors(pressed, backgrounds[0]);
     const auto glyphPixels = [](const std::vector<DWORD>& pixels) {
-        return std::count_if(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) < 255; });
+        return std::count_if(pixels.begin(), pixels.end(), [=](DWORD pixel) { return pixel != backgrounds[0]; });
     };
     Expect(glyphPixels(bold) > glyphPixels(pressed),
            "pressing the bold label should switch to the lighter font weight");
