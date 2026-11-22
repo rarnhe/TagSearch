@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwchar>
+#include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace tagsearch {
@@ -138,6 +142,70 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
     return CountOverlappingWindows(bounds);
 }
 
+namespace {
+
+std::wstring_view TrimIniValue(std::wstring_view value) {
+    const auto first = value.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring_view::npos) return {};
+    return value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+}
+
+std::wstring ReadIconIniValue(const std::filesystem::path& ini, const wchar_t* key) {
+    constexpr DWORD maxLength = 32768;
+    for (DWORD capacity = 512; capacity <= maxLength; capacity *= 2) {
+        std::wstring value(capacity, L'\0');
+        const DWORD length = GetPrivateProfileStringW(
+            L".ShellClassInfo", key, L"", value.data(), capacity, ini.c_str());
+        if (length < capacity - 1) {
+            value.resize(length);
+            return value;
+        }
+    }
+    return {};
+}
+
+std::optional<int> ParseIconIndex(std::wstring_view text) {
+    const std::wstring value(TrimIniValue(text));
+    wchar_t* end = nullptr;
+    const auto index = std::wcstoll(value.c_str(), &end, 10);
+    if (!end || end == value.c_str() || *end || index < std::numeric_limits<int>::min() ||
+        index > std::numeric_limits<int>::max()) return std::nullopt;
+    return static_cast<int>(index);
+}
+
+} // namespace
+
+std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder) {
+    const auto ini = folder / L"desktop.ini";
+    auto value = ReadIconIniValue(ini, L"IconResource");
+    int index = 0;
+    if (value.empty()) {
+        value = ReadIconIniValue(ini, L"IconFile");
+        index = ParseIconIndex(ReadIconIniValue(ini, L"IconIndex")).value_or(0);
+    } else if (const auto comma = value.rfind(L','); comma != std::wstring::npos) {
+        if (const auto parsed = ParseIconIndex(std::wstring_view(value).substr(comma + 1))) {
+            index = *parsed;
+            value.resize(comma);
+        }
+    }
+
+    auto path = TrimIniValue(value);
+    if (path.size() > 1 && path.front() == L'"' && path.back() == L'"') {
+        path = path.substr(1, path.size() - 2);
+    }
+    if (path.empty()) return std::nullopt;
+
+    const std::wstring input(path);
+    const DWORD capacity = ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
+    if (!capacity || capacity > 32768) return std::nullopt;
+    std::wstring expanded(capacity, L'\0');
+    const DWORD length = ExpandEnvironmentStringsW(input.c_str(), expanded.data(), capacity);
+    if (!length || length > capacity) return std::nullopt;
+    expanded.resize(length - 1);
+
+    return std::pair{(folder / expanded).lexically_normal(), index};
+}
+
 } // namespace tagsearch
 
 #ifndef TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
@@ -145,15 +213,12 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <windowsx.h>
-#include <cwchar>
 #include <future>
 #include <iterator>
 #include <memory>
-#include <optional>
 #include <system_error>
 #include <thread>
 #include <type_traits>
-#include <utility>
 
 // Each executable supplies this externally linked entry point for the CRT.
 int WINAPI wWinMain(
@@ -211,6 +276,29 @@ struct ScanResult {
     bool success = false;
 };
 
+using IconResource = std::pair<std::filesystem::path, int>;
+using OwnedIcon = std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)>;
+using NoticeIcons = std::map<IconResource, OwnedIcon>;
+
+struct ScanNoticeData {
+    tagsearch::Folders folders;
+    NoticeIcons icons;
+};
+
+NoticeIcons LoadNoticeIcons(std::span<const std::filesystem::path> folders, std::stop_token stop) {
+    NoticeIcons icons;
+    for (const auto& folder : folders) {
+        if (stop.stop_requested()) break;
+        auto resource = tagsearch::ReadCaptionIconResource(folder);
+        if (!resource || icons.contains(*resource)) continue;
+
+        HICON icon = nullptr;
+        ExtractIconExW(resource->first.c_str(), resource->second, nullptr, &icon, 1);
+        if (icon) icons.emplace(std::move(*resource), OwnedIcon(icon, &DestroyIcon));
+    }
+    return icons;
+}
+
 struct Caption {
     HINSTANCE instance;
     HWND controller = nullptr;
@@ -222,7 +310,8 @@ struct Caption {
     UINT lastNoticeIcon = 0;
     bool exitAfterNotices = false;
     ScanResult scan;
-    std::future<tagsearch::Folders> scanNoticeFolders;
+    NoticeIcons noticeIcons;
+    std::future<ScanNoticeData> scanNotice;
     std::jthread scanner;
 
     void DismissNotice(UINT& icon) {
@@ -414,14 +503,20 @@ void ShowNotice(Caption& caption, UINT& icon, const std::wstring& title, std::ws
     notice.uID = caption.lastNoticeIcon;
     notice.uFlags = NIF_ICON | NIF_MESSAGE;
     notice.uCallbackMessage = kNoticeEvent;
-    notice.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    HICON iconForNotice = nullptr;
+    if (!caption.noticeIcons.empty()) {
+        const auto offset = std::uniform_int_distribution<std::size_t>(0, caption.noticeIcons.size() - 1)(caption.random);
+        iconForNotice = std::next(caption.noticeIcons.begin(), static_cast<std::ptrdiff_t>(offset))->second.get();
+    }
+    notice.hIcon = iconForNotice ? iconForNotice : LoadIconW(nullptr, IDI_APPLICATION);
     if (!Shell_NotifyIconW(NIM_ADD, &notice)) return;
 
     icon = notice.uID;
     notice.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &notice);
     notice.uFlags = NIF_INFO;
-    notice.dwInfoFlags = NIIF_INFO;
+    notice.dwInfoFlags = iconForNotice ? NIIF_USER : NIIF_INFO;
+    notice.hBalloonIcon = iconForNotice;
     wcscpy_s(notice.szInfoTitle, title.c_str());
     wcscpy_s(notice.szInfo, body.c_str());
     if (!Shell_NotifyIconW(NIM_MODIFY, &notice) ||
@@ -706,7 +801,7 @@ void ActivateTags(Caption& caption) {
     if (!windows.empty()) SetForegroundWindow(windows.front());
 }
 
-void ScanInBackground(Caption& caption, std::promise<tagsearch::Folders>& noticeFolders, std::stop_token stop) {
+void ScanInBackground(Caption& caption, std::promise<ScanNoticeData>& notice, std::stop_token stop) {
     auto& scan = caption.scan;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         try {
@@ -714,7 +809,9 @@ void ScanInBackground(Caption& caption, std::promise<tagsearch::Folders>& notice
             std::size_t defaultCount = 0;
             scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount);
             if (!stop.stop_requested()) {
-                noticeFolders.set_value(ScanNoticeFolders(commandLine, std::span(scan.folders).first(defaultCount)));
+                const std::span<const std::filesystem::path> folders = scan.folders;
+                notice.set_value({ScanNoticeFolders(commandLine, folders.first(defaultCount)),
+                                  LoadNoticeIcons(folders.subspan(defaultCount), stop)});
                 PostMessageW(caption.controller, kScanStarted, 0, 0);
                 scan.tags = tagsearch::ScanTags(scan.folders, stop);
                 scan.success = !stop.stop_requested();
@@ -730,10 +827,10 @@ void ScanInBackground(Caption& caption, std::promise<tagsearch::Folders>& notice
 
 bool StartStartupScan(Caption& caption) {
     try {
-        std::promise<tagsearch::Folders> noticeFolders;
-        caption.scanNoticeFolders = noticeFolders.get_future();
-        caption.scanner = std::jthread([&caption, noticeFolders = std::move(noticeFolders)](std::stop_token stop) mutable {
-            ScanInBackground(caption, noticeFolders, stop);
+        std::promise<ScanNoticeData> notice;
+        caption.scanNotice = notice.get_future();
+        caption.scanner = std::jthread([&caption, notice = std::move(notice)](std::stop_token stop) mutable {
+            ScanInBackground(caption, notice, stop);
         });
     } catch (const std::system_error&) {
         return false;
@@ -779,9 +876,10 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
     switch (message) {
     case kScanStarted:
-        if (caption->scanNoticeFolders.valid()) {
-            ShowNotice(*caption, caption->scanIcon, L"正在读取标签…",
-                       ScanNoticeBody(window, caption->scanNoticeFolders.get()));
+        if (caption->scanNotice.valid()) {
+            auto notice = caption->scanNotice.get();
+            caption->noticeIcons = std::move(notice.icons);
+            ShowNotice(*caption, caption->scanIcon, L"正在读取标签…", ScanNoticeBody(window, notice.folders));
         }
         return 0;
     case kScanComplete:

@@ -12,10 +12,16 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <optional>
+#include <shellapi.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace tagsearch {
+std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder);
+}
 
 namespace {
 
@@ -288,6 +294,44 @@ std::size_t CountCaptionIntersections(std::span<const RECT> windows, const RECT&
     return count;
 }
 
+void CaptionReadsDesktopIniIconResource() {
+    TestDirectory test;
+    {
+        const std::wstring ini =
+            L"\ufeff[.ShellClassInfo]\r\nIconResource=\"icons\\标记, light.ico\", -7\r\n"
+            L"IconFile=ignored.ico\r\nIconIndex=1\r\n";
+        std::ofstream file(test.path / L"desktop.ini", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(ini.data()), static_cast<std::streamsize>(ini.size() * sizeof(wchar_t)));
+        Expect(file.good(), "the fixture should write a Unicode desktop.ini");
+    }
+
+    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    ExpectEqual(icon, std::optional{std::pair{test.path / L"icons" / L"标记, light.ico", -7}},
+                "IconResource should retain a quoted relative path and signed index");
+    Expect(!tagsearch::ReadCaptionIconResource(test.path / L"missing"),
+           "a folder without desktop.ini should not supply an icon");
+}
+
+void CaptionReadsLegacyDesktopIniIcon() {
+    TestDirectory test;
+    {
+        std::ofstream file(test.path / L"desktop.ini");
+        file << "[.ShellClassInfo]\nIconFile=%SystemRoot%\\System32\\shell32.dll\nIconIndex=0\n";
+        Expect(file.good(), "the fixture should write an ANSI desktop.ini");
+    }
+
+    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    if (!icon) throw std::runtime_error("IconFile and IconIndex should supply a resource");
+    Expect(icon->first.is_absolute() && icon->first.filename() == L"shell32.dll" && icon->second == 0,
+           "the legacy icon should expand Windows environment variables and retain its index");
+
+    HICON handle = nullptr;
+    ExtractIconExW(icon->first.c_str(), icon->second, nullptr, &handle, 1);
+    const bool extracted = handle != nullptr;
+    if (handle) DestroyIcon(handle);
+    Expect(extracted, "the returned location should load as a Win32 notification icon");
+}
+
 void CaptionLayoutPacksVariableWidths() {
     const RECT work{-200, 30, 0, 80};
     const std::array<LONG, 6> widths{120, 120, 50, 50, 30, 30};
@@ -420,6 +464,8 @@ int main(int argc, char** argv) {
         {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
         {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
+        {"caption_reads_desktop_ini_icon_resource", CaptionReadsDesktopIniIconResource},
+        {"caption_reads_legacy_desktop_ini_icon", CaptionReadsLegacyDesktopIniIcon},
         {"caption_layout_packs_variable_widths", CaptionLayoutPacksVariableWidths},
         {"caption_layout_keeps_all_crowded_windows_and_counts_overlap", CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap},
         {"caption_layout_randomizes_positions", CaptionLayoutRandomizesPositions},

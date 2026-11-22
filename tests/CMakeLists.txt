@@ -2,7 +2,7 @@ if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "TagSearch tests require Windows, MSVC and the Windows SDK")
 endif()
 
-# Compile the production layout directly, without the Win32 app entry point.
+# Compile the Caption layout and icon configuration reader without the app entry point.
 add_executable(tagsearch_tests test_tagsearch.cpp ../TagSearch_Caption.cpp TagSearch_Layout.h)
 target_link_libraries(tagsearch_tests PRIVATE TagSearchCore)
 target_compile_definitions(tagsearch_tests PRIVATE
@@ -27,6 +27,8 @@ set(cases
     search_condition_keeps_one_tag_literal
     search_condition_combines_all_tags_with_and
     create_search_folder_accepts_combined_tags
+    caption_reads_desktop_ini_icon_resource
+    caption_reads_legacy_desktop_ini_icon
     caption_layout_packs_variable_widths
     caption_layout_keeps_all_crowded_windows_and_counts_overlap
     caption_layout_randomizes_positions
