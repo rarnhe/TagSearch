@@ -7,6 +7,8 @@
 #include <shlobj.h>
 #include <structuredquery.h>
 #include <wrl/client.h>
+#include <winrt/Windows.UI.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 
 #include <algorithm>
 #include <array>
@@ -122,6 +124,14 @@ Tags SplitKeywords(std::wstring_view value) {
 }
 
 COLORREF WindowAccentColor() {
+    using namespace winrt::Windows::UI::ViewManagement;
+    try {
+        const auto accent = UISettings().GetColorValue(UIColorType::Accent);
+        return RGB(accent.R, accent.G, accent.B);
+    } catch (const winrt::hresult_error&) {
+        // Older or restricted systems can still expose a DWM color.
+    }
+
     DWORD argb = 0;
     BOOL opaque = FALSE;
     if (FAILED(DwmGetColorizationColor(&argb, &opaque))) return GetSysColor(COLOR_HIGHLIGHT);
