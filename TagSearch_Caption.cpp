@@ -912,8 +912,7 @@ void ScanInBackground(Caption& caption, std::promise<ScanNoticeData>& notice, st
         try {
             const auto commandLine = GetCommandLineW();
             std::size_t defaultCount = 0;
-            tagsearch::Folders requestedFolders;
-            scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount, &requestedFolders);
+            scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount);
             if (!stop.stop_requested()) {
                 const std::span<const std::filesystem::path> folders = scan.folders;
                 auto displayFolders = ScanNoticeArguments(commandLine);
@@ -922,7 +921,7 @@ void ScanInBackground(Caption& caption, std::promise<ScanNoticeData>& notice, st
                 if (!hasFolderArguments) displayFolders.assign(iconFolders.begin(), iconFolders.end());
                 notice.set_value({std::move(displayFolders), LoadNoticeIcons(iconFolders, stop)});
                 PostMessageW(caption.controller, kScanStarted, 0, 0);
-                scan.tags = tagsearch::ScanCaptionTags(scan.folders, requestedFolders, stop);
+                scan.tags = tagsearch::ScanCaptionTags(scan.folders, defaultCount, stop);
                 scan.success = !stop.stop_requested();
             }
         } catch (...) {

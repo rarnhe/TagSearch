@@ -33,17 +33,15 @@ using TaskMemory = std::unique_ptr<T, decltype(&CoTaskMemFree)>;
 
 using Pidl = TaskMemory<std::remove_pointer_t<PIDLIST_ABSOLUTE>>;
 
-void AddFolder(Folders& folders, const fs::path& candidate, Folders* requested = nullptr) {
-    if (candidate.empty()) return;
+void AddFolder(Folders& folders, const fs::path& candidate) {
+    if (candidate.empty()) {
+        return;
+    }
 
     std::error_code error;
     auto folder = fs::canonical(candidate, error);
-    if (error || !fs::is_directory(folder, error)) return;
-
-    if (requested && std::find(requested->begin(), requested->end(), folder) == requested->end()) {
-        requested->push_back(folder);
-    }
-    if (std::find(folders.begin(), folders.end(), folder) == folders.end()) {
+    if (!error && fs::is_directory(folder, error) &&
+        std::find(folders.begin(), folders.end(), folder) == folders.end()) {
         folders.push_back(std::move(folder));
     }
 }
@@ -151,18 +149,17 @@ std::vector<std::wstring> NormalizeTags(std::vector<std::wstring> tags) {
     return normalized;
 }
 
-Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount, Folders* requestedFolders) {
+Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount) {
     Folders folders;
     AddKnownFolder(folders, FOLDERID_Desktop);
     AddKnownFolder(folders, FOLDERID_Downloads);
     if (defaultCount) *defaultCount = folders.size();
-    if (requestedFolders) requestedFolders->clear();
 
     int count = 0;
     const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
         CommandLineToArgvW(commandLine, &count), &LocalFree);
     for (int i = 1; arguments && i < count; ++i) {
-        AddFolder(folders, arguments.get()[i], requestedFolders);
+        AddFolder(folders, arguments.get()[i]);
     }
     return folders;
 }
@@ -407,8 +404,9 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
     return ScanTagsWithSnapshots(folders, {}, stop);
 }
 
-Tags ScanCaptionTags(const Folders& folders, const Folders& requestedFolders, std::stop_token stop) {
-    auto ordered = requestedFolders;
+Tags ScanCaptionTags(const Folders& folders, std::size_t defaultCount, std::stop_token stop) {
+    const auto requestedFolders = std::span(folders).subspan(defaultCount);
+    Folders ordered(requestedFolders.begin(), requestedFolders.end());
     // Resolve children first so a parent scan can reuse any explicitly requested child snapshot.
     std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
         return left.native().size() > right.native().size();

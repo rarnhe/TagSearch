@@ -21,6 +21,7 @@ set(cases
     resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs
     scan_tags_reads_nested_shell_properties_without_using_cache
     caption_caches_requested_folders_independently
+    caption_scans_default_roots_live_and_repairs_invalid_cache
     caption_combines_warm_and_cold_nested_folders
     create_search_folder_accepts_multiple_scopes_and_literal_tag
     create_search_folder_rejects_empty_scope

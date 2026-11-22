@@ -115,11 +115,13 @@ void ResolveFoldersKeepsKnownFolders() {
     }
 
     TestDirectory test;
-    const auto command = L"TagSearch.exe \"" + test.path.wstring() + L"\"";
-    const auto combined = tagsearch::ResolveSearchFolders(command.c_str());
-    Expect(combined.size() == defaultFolders.size() + 1 &&
+    auto command = L"TagSearch.exe \"" + test.path.wstring() + L"\"";
+    if (!defaultFolders.empty()) command += L" \"" + defaultFolders.front().wstring() + L"\"";
+    std::size_t defaultCount = 0;
+    const auto combined = tagsearch::ResolveSearchFolders(command.c_str(), &defaultCount);
+    Expect(defaultCount == defaultFolders.size() && combined.size() == defaultCount + 1 &&
                std::equal(defaultFolders.begin(), defaultFolders.end(), combined.begin()),
-           "additional folders should extend the known folders");
+           "explicitly repeating a default folder should keep it in the default prefix");
 }
 
 void ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs() {
@@ -189,10 +191,9 @@ void CaptionCachesRequestedFoldersIndependently() {
                               "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp2=31,Folder title\n"
                               "[Other]\nProp5=31,unrelated\n";
 
-    const tagsearch::Folders requested{first, second};
     const tagsearch::Folders folders{test.path, first, second};
     const auto expected = tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"});
-    ExpectEqual(tagsearch::ScanCaptionTags(folders, requested), expected,
+    ExpectEqual(tagsearch::ScanCaptionTags(folders, 1), expected,
                 "a cold scan should merge deduplicated tags from requested directories");
     const auto firstKeywords = IniValue(firstIni, summarySection, L"Prop5");
     Expect(firstKeywords.starts_with(L"31,"), "the first directory should store a summary value");
@@ -211,12 +212,46 @@ void CaptionCachesRequestedFoldersIndependently() {
     fs::remove_all(first / L"nested");
     fs::remove(first / L"duplicate.jpg");
     fs::copy_file(fixturePath, second / L"new.jpg");
-    ExpectEqual(tagsearch::ScanCaptionTags(folders, requested), expected,
+    ExpectEqual(tagsearch::ScanCaptionTags(folders, 1), expected,
                 "a warm run should reuse the stored snapshot after the original files are removed");
 
     fs::remove(firstIni);
-    Expect(tagsearch::ScanCaptionTags(folders, requested).empty(),
+    Expect(tagsearch::ScanCaptionTags(folders, 1).empty(),
            "an empty cache should skip newly added files even when an implicit root contains it");
+}
+
+void CaptionScansDefaultRootsLiveAndRepairsInvalidCache() {
+    TestDirectory test;
+    const auto desktop = test.path / L"Desktop";
+    const auto downloads = test.path / L"Downloads";
+    const auto first = test.path / L"FolderA";
+    const auto second = test.path / L"FolderB";
+    for (const auto& folder : {desktop, downloads, first, second}) fs::create_directory(folder);
+
+    const auto desktopIni = desktop / L"desktop.ini";
+    const auto firstIni = first / L"desktop.ini";
+    const auto secondIni = second / L"desktop.ini";
+    std::ofstream(desktopIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=31,desktop value\n";
+    std::ofstream(firstIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=31,cached A;cached A\n";
+    std::ofstream(secondIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
+                               "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=19,invalid cache\n";
+    fs::copy_file(fixturePath, desktop / L"live.jpg");
+
+    // A live Shell read can expose a folder's own metadata, so compare against its actual live tags.
+    auto expected = tagsearch::ScanTags({desktop, downloads});
+    Expect(std::find(expected.begin(), expected.end(), L"alpha") != expected.end(),
+           "the default desktop fixture should provide a live file tag");
+    expected.push_back(L"cached A");
+    const tagsearch::Folders folders{desktop, downloads, first, second};
+    ExpectEqual(tagsearch::ScanCaptionTags(folders, 2), tagsearch::NormalizeTags(std::move(expected)),
+                "default live tags and explicit cached tags should be combined and deduplicated");
+    ExpectEqual(IniValue(desktopIni, summarySection, L"Prop5"), std::wstring(L"31,desktop value"),
+                "an existing default desktop.ini should be left alone");
+    Expect(!fs::exists(downloads / L"desktop.ini"), "a default folder without desktop.ini should stay that way");
+    ExpectEqual(IniValue(secondIni, summarySection, L"Prop5"), std::wstring(L"31,"),
+                "an invalid type should trigger a live scan and a new tag list in the existing file");
+    ExpectEqual(IniValue(secondIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
+                "repairing an invalid cache should preserve the custom icon");
 }
 
 void CaptionCombinesWarmAndColdNestedFolders() {
@@ -228,7 +263,7 @@ void CaptionCombinesWarmAndColdNestedFolders() {
                               "Prop5 = 31, cached ;cached; child\n";
     fs::copy_file(fixturePath, child / L"live-only.jpg");
     const auto expected = tagsearch::NormalizeTags({L"cached", L"child"});
-    ExpectEqual(tagsearch::ScanCaptionTags({test.path, child}, {test.path, child}), expected,
+    ExpectEqual(tagsearch::ScanCaptionTags({test.path, child}, 0), expected,
                 "a cold parent should reuse a requested child's valid cache without rescanning the child");
     const auto parentKeywords = IniValue(test.path / L"desktop.ini", summarySection, L"Prop5");
     Expect(parentKeywords.starts_with(L"31,"), "the parent should store its own summary value");
@@ -624,6 +659,7 @@ int main(int argc, char** argv) {
         {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
         {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
         {"caption_caches_requested_folders_independently", CaptionCachesRequestedFoldersIndependently},
+        {"caption_scans_default_roots_live_and_repairs_invalid_cache", CaptionScansDefaultRootsLiveAndRepairsInvalidCache},
         {"caption_combines_warm_and_cold_nested_folders", CaptionCombinesWarmAndColdNestedFolders},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
