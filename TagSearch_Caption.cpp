@@ -280,7 +280,6 @@ struct FloatingTag {
     bool pressed = false;
     bool dragging = false;
     bool moved = false;
-    bool coloredCaption = false;
     POINT start{};
     POINT last{};
     std::vector<tagsearch::TagSearchTerm> clickTerms;
@@ -293,6 +292,7 @@ struct ScanResult {
 };
 
 using tagsearch::IconResource;
+using OwnedFont = std::unique_ptr<std::remove_pointer_t<HFONT>, decltype(&DeleteObject)>;
 using OwnedIcon = std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)>;
 using NoticeIcons = std::map<IconResource, OwnedIcon>;
 
@@ -345,6 +345,8 @@ NoticeIcons LoadNoticeIcons(std::span<const std::filesystem::path> folders, std:
 struct Caption {
     HINSTANCE instance;
     HWND controller = nullptr;
+    OwnedFont titleFont{nullptr, &DeleteObject};
+    OwnedFont boldTitleFont{nullptr, &DeleteObject};
     std::vector<std::unique_ptr<FloatingTag>> tags;
     std::mt19937 random{std::random_device{}()};
     tagsearch::Folders folders;
@@ -403,75 +405,35 @@ RECT PrimaryWorkArea() {
     return monitor.rcWork;
 }
 
-bool HighContrastEnabled() {
-    HIGHCONTRASTW contrast{sizeof(contrast)};
-    return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
-           (contrast.dwFlags & HCF_HIGHCONTRASTON);
-}
-
-COLORREF TagCaptionColor(TagOperator operation) {
-    return kTagModes[static_cast<std::size_t>(operation)].color;
-}
-
-void ApplyTagColor(HWND window, FloatingTag& tag) {
-    const COLORREF color = HighContrastEnabled() ? DWMWA_COLOR_DEFAULT : TagCaptionColor(tag.operation);
-    const HRESULT result = DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &color, sizeof(color));
-    tag.coloredCaption = SUCCEEDED(result) && color != DWMWA_COLOR_DEFAULT;
-    const COLORREF text = tag.coloredCaption ? GetSysColor(COLOR_WINDOWTEXT) : DWMWA_COLOR_DEFAULT;
-    DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &text, sizeof(text));
-}
-
 HFONT CreateCaptionFont(UINT dpi, bool bold) {
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)) return nullptr;
-    if (bold) metrics.lfSmCaptionFont.lfWeight = FW_BOLD;
+    metrics.lfSmCaptionFont.lfWeight = bold ? FW_BOLD : FW_NORMAL;
     return CreateFontIndirectW(&metrics.lfSmCaptionFont);
 }
 
-void PaintBoldCaption(HWND window, const FloatingTag& tag) {
-    RECT bounds{};
-    RECT client{};
-    POINT origin{};
-    if (!GetWindowRect(window, &bounds) || !GetClientRect(window, &client) ||
-        !ClientToScreen(window, &origin)) return;
+void PaintCaption(HWND window, HDC dc, const FloatingTag& tag) {
+    RECT caption{};
+    if (!GetClientRect(window, &caption) || IsRectEmpty(&caption)) return;
 
-    const UINT dpi = WindowDpi(window);
-    const LONG left = origin.x - bounds.left;
-    const LONG bottom = origin.y - bounds.top;
-    const LONG height = GetSystemMetricsForDpi(SM_CYSMCAPTION, dpi);
-    const RECT caption{left, std::max(0L, bottom - height), left + client.right, bottom};
-    if (IsRectEmpty(&caption)) return;
+    const COLORREF background = kTagModes[static_cast<std::size_t>(tag.operation)].color;
+    SetBkColor(dc, background);
+    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &caption, L"", 0, nullptr);
 
-    const HFONT font = CreateCaptionFont(dpi, true);
-    if (!font) return;
-    const HDC dc = GetWindowDC(window);
-    if (!dc) {
-        DeleteObject(font);
-        return;
-    }
-
-    const bool active = GetActiveWindow() == window;
-    const COLORREF background = tag.coloredCaption ? TagCaptionColor(tag.operation)
-        : GetSysColor(active ? COLOR_ACTIVECAPTION : COLOR_INACTIVECAPTION);
-    const COLORREF text = GetSysColor(tag.coloredCaption ? COLOR_WINDOWTEXT
-        : (active ? COLOR_CAPTIONTEXT : COLOR_INACTIVECAPTIONTEXT));
-    SetDCBrushColor(dc, background);
-    FillRect(dc, &caption, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-
-    const int padding = Scale(kTitlePadding, dpi);
-    RECT label{caption.left + padding, caption.top, caption.right - padding, caption.bottom};
-    const auto previousFont = SelectObject(dc, font);
+    const auto& font = tag.pressed ? tag.caption.boldTitleFont : tag.caption.titleFont;
+    const auto previousFont = font ? SelectObject(dc, font.get()) : nullptr;
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, text);
-    DrawTextW(dc, tag.text.c_str(), -1, &label,
+    SetTextColor(dc, RGB(255, 255, 255));
+    const int padding = Scale(kTitlePadding, WindowDpi(window));
+    caption.left += padding;
+    caption.right -= padding;
+    DrawTextW(dc, tag.text.c_str(), -1, &caption,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     if (previousFont) SelectObject(dc, previousFont);
-    ReleaseDC(window, dc);
-    DeleteObject(font);
 }
 
 void RedrawCaption(HWND window) {
-    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
 }
 
 std::vector<tagsearch::TagWindowBounds> VisibleTagsInZOrder(const Caption& caption) {
@@ -741,17 +703,28 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
 
     switch (message) {
     case WM_CREATE: {
-        // Let the pressed label paint over the DWM caption while retaining its frame and shadow.
-        constexpr BOOL allowNonClientPaint = TRUE;
-        DwmSetWindowAttribute(window, DWMWA_ALLOW_NCPAINT, &allowNonClientPaint, sizeof(allowNonClientPaint));
-        ApplyTagColor(window, *tag);
-        break;
+        // Keep a DWM frame around the title, whose colors and font are painted in the client area.
+        constexpr MARGINS frame{1, 1, 1, 1};
+        DwmExtendFrameIntoClientArea(window, &frame);
+        return 0;
     }
-    case WM_SYSCOLORCHANGE:
-    case WM_SETTINGCHANGE:
-    case WM_THEMECHANGED:
-        ApplyTagColor(window, *tag);
+    case WM_NCCALCSIZE:
+        if (wParam) return 0;
         break;
+    case WM_NCHITTEST: {
+        const auto hit = DefWindowProcW(window, message, wParam, lParam);
+        return hit == HTCLIENT ? HTCAPTION : hit;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        const HDC dc = BeginPaint(window, &paint);
+        if (dc) PaintCaption(window, dc, *tag);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_PRINTCLIENT:
+        if (wParam) PaintCaption(window, reinterpret_cast<HDC>(wParam), *tag);
+        return 0;
     case WM_MOUSEACTIVATE:
         // Mouse activation can raise a lower window before the click is dispatched.
         if (LOWORD(lParam) == HTCAPTION &&
@@ -819,12 +792,6 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         if (wasPressed) RedrawCaption(window);
         return 0;
     }
-    case WM_NCPAINT:
-    case WM_NCACTIVATE: {
-        const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
-        if (tag->pressed) PaintBoldCaption(window, *tag);
-        return result;
-    }
     case WM_KEYDOWN:
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
             if ((HIWORD(lParam) & KF_REPEAT) == 0) ActivateTag(window, *tag, {});
@@ -842,7 +809,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case kSetTagMode:
         if (wParam > 0 && wParam <= std::size(kTagModes)) {
             tag->operation = kTagModes[wParam - 1].operation;
-            ApplyTagColor(window, *tag);
+            RedrawCaption(window);
         }
         return 0;
     case WM_CLOSE:
@@ -869,8 +836,10 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
     if (!AdjustWindowRectExForDpi(&frame, kTagStyle, FALSE, kTagExStyle, dpi) ||
         frame.bottom <= frame.top) return false;
 
-    const HFONT font = CreateCaptionFont(dpi, false);
-    const HFONT bold = CreateCaptionFont(dpi, true);
+    caption.titleFont.reset(CreateCaptionFont(dpi, false));
+    caption.boldTitleFont.reset(CreateCaptionFont(dpi, true));
+    const HFONT font = caption.titleFont.get();
+    const HFONT bold = caption.boldTitleFont.get();
     const HDC dc = GetDC(caption.controller);
     const auto oldFont = dc && font ? SelectObject(dc, font) : nullptr;
     std::vector<LONG> widths;
@@ -898,8 +867,6 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(caption.controller, dc);
     }
-    if (bold) DeleteObject(bold);
-    if (font) DeleteObject(font);
 
     std::vector<RECT> bounds(widths.size());
     const LONG height = frame.bottom - frame.top;

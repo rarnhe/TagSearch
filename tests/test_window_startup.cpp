@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -310,7 +311,7 @@ void ReadVisibleCaptionTags(DWORD threadId, VisibleTags& tags) {
     EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
 }
 
-void CheckNativeCaption(HWND window, const RECT& bounds) {
+void CheckCaptionFrame(HWND window, const RECT& bounds) {
     const auto style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
     constexpr DWORD nativeStyle = WS_POPUP | WS_CAPTION;
     constexpr DWORD extraStyles = WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CHILD;
@@ -320,12 +321,10 @@ void CheckNativeCaption(HWND window, const RECT& bounds) {
     Expect((extended & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) == WS_EX_TOOLWINDOW,
            "a tag should be a native tool window without a layered surface");
     RECT client{};
-    POINT clientOrigin{};
-    Expect(GetClientRect(window, &client) && client.bottom == client.top &&
-           ClientToScreen(window, &clientOrigin) && clientOrigin.y > bounds.top,
-           "the native title bar should be visible with zero client-area height");
-    const auto captionPoint = MAKELPARAM(bounds.left + (bounds.right - bounds.left) / 2,
-                                         bounds.top + (clientOrigin.y - bounds.top) / 2);
+    Expect(GetClientRect(window, &client) && client.right == bounds.right - bounds.left &&
+           client.bottom == bounds.bottom - bounds.top,
+           "the title should occupy the client area of the caption-only window");
+    const auto captionPoint = MAKELPARAM(bounds.left + client.right / 2, bounds.top + client.bottom / 2);
     DWORD_PTR hit = 0;
     Expect(SendMessageTimeoutW(window, WM_NCHITTEST, 0, captionPoint, SMTO_ABORTIFHUNG, 1000, &hit) &&
            hit == HTCAPTION, "Windows should hit-test the tag as a native title bar");
@@ -336,8 +335,76 @@ void CheckTagBounds(const VisibleTags& tags, const RECT& work) {
         const auto& rect = tags.bounds[i];
         Expect(!IsRectEmpty(&rect) && Within(rect, work),
                "the tag window must stay inside the primary work area");
-        CheckNativeCaption(tags.windows[i], rect);
+        CheckCaptionFrame(tags.windows[i], rect);
     }
+}
+
+std::vector<DWORD> PrintCaption(HWND window) {
+    RECT client{};
+    Expect(GetClientRect(window, &client) && client.right > 0 && client.bottom > 0,
+           "the rendered caption should have a client rectangle");
+    std::vector<DWORD> pixels(static_cast<std::size_t>(client.right) * client.bottom);
+    const HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) throw std::runtime_error("the caption snapshot needs a memory DC");
+
+    BITMAPINFO image{};
+    image.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    image.bmiHeader.biWidth = client.right;
+    image.bmiHeader.biHeight = -client.bottom;
+    image.bmiHeader.biPlanes = 1;
+    image.bmiHeader.biBitCount = 32;
+    image.bmiHeader.biCompression = BI_RGB;
+
+    void* data = nullptr;
+    const HBITMAP bitmap = CreateDIBSection(dc, &image, DIB_RGB_COLORS, &data, nullptr, 0);
+    if (!bitmap || !data) {
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(dc);
+        throw std::runtime_error("the caption snapshot needs a bitmap");
+    }
+    const auto previous = SelectObject(dc, bitmap);
+    const bool printed = PrintWindow(window, dc, PW_CLIENTONLY) != FALSE;
+    GdiFlush();
+    if (printed) std::memcpy(pixels.data(), data, pixels.size() * sizeof(DWORD));
+    if (previous) SelectObject(dc, previous);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    Expect(printed, "PrintWindow should render the title onto the bitmap");
+    for (auto& pixel : pixels) pixel &= 0x00ffffff;
+    return pixels;
+}
+
+void CheckCaptionPaint(HWND window) {
+    const auto send = [window](UINT message, WPARAM parameter = 0) {
+        DWORD_PTR result = 0;
+        Expect(SendMessageTimeoutW(window, message, parameter, 0, SMTO_ABORTIFHUNG, 1000, &result),
+               "the caption should handle the test input");
+    };
+    const auto checkColors = [](const std::vector<DWORD>& pixels, DWORD background) {
+        Expect(pixels.front() == background, "the caption should paint the PR #8 operator background");
+        Expect(std::any_of(pixels.begin(), pixels.end(), [=](DWORD pixel) {
+            return pixel != background &&
+                (pixel & 0xff0000) >= (background & 0xff0000) &&
+                (pixel & 0x00ff00) >= (background & 0x00ff00) &&
+                (pixel & 0x0000ff) >= (background & 0x0000ff);
+        }), "the title should use white text over the operator background");
+    };
+
+    constexpr UINT setTagMode = WM_APP + 5;
+    constexpr DWORD backgrounds[]{0xbeebc7, 0xf8cadb, 0xd2d4d8};
+    for (std::size_t i = 0; i < std::size(backgrounds); ++i) {
+        send(setTagMode, i + 1);
+        checkColors(PrintCaption(window), backgrounds[i]);
+    }
+
+    send(setTagMode, 1);
+    const auto normal = PrintCaption(window);
+    send(WM_NCLBUTTONDOWN, HTCAPTION);
+    const auto pressed = PrintCaption(window);
+    checkColors(pressed, backgrounds[0]);
+    Expect(pressed != normal, "pressing the label should repaint it in bold over the same background");
+    send(WM_CANCELMODE);
+    Expect(PrintCaption(window) == normal, "canceling the press should restore the regular title");
 }
 
 bool HasIntersection(const std::vector<RECT>& bounds) {
@@ -373,6 +440,9 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     Expect(!HasIntersection(tags.bounds), "two short tags should fit without overlap");
     Expect(std::find(tags.windows.begin(), tags.windows.end(), GetForegroundWindow()) == tags.windows.end(),
            "initial Caption display should leave the foreground with the previous application");
+
+    const auto alpha = std::find(tags.titles.begin(), tags.titles.end(), L"alpha");
+    CheckCaptionPaint(tags.windows[static_cast<std::size_t>(alpha - tags.titles.begin())]);
 
     const auto originalWindows = tags.windows;
     const HWND tag = originalWindows.front();
