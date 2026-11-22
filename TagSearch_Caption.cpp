@@ -222,7 +222,7 @@ struct Caption {
     UINT lastNoticeIcon = 0;
     bool exitAfterNotices = false;
     ScanResult scan;
-    std::future<std::wstring> scanFolderNames;
+    std::future<tagsearch::Folders> scanNoticeFolders;
     std::jthread scanner;
 
     void DismissNotice(UINT& icon) {
@@ -323,46 +323,52 @@ std::vector<TagGroup> OverlapGroups(std::span<const tagsearch::TagWindowBounds> 
 }
 
 template <typename FitsLine>
-std::wstring FormatOverlapLines(std::span<const tagsearch::TagWindowBounds> windows,
-                                std::span<const TagGroup> groups, std::size_t limit, FitsLine fitsLine) {
+bool AppendNoticeLine(std::wstring& message, std::wstring line, std::size_t limit, const FitsLine& fitsLine) {
     constexpr std::wstring_view ellipsis = L"...";
+    const std::size_t separator = message.empty() ? 0 : 1;
+    const std::size_t available = limit - message.size();
+    if (available < separator + ellipsis.size()) return false;
+
+    std::replace_if(line.begin(), line.end(), [](wchar_t ch) {
+        return ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == 0x2028 || ch == 0x2029;
+    }, L' ');
+
+    const auto lineLimit = available - separator;
+    if (line.size() > lineLimit || !fitsLine(line)) {
+        line.resize(std::min(line.size(), lineLimit - ellipsis.size()));
+        for (;;) {
+            if (!line.empty() && ((line.back() >= 0xd800 && line.back() <= 0xdbff) || line.back() == L'·')) {
+                line.pop_back();
+                continue;
+            }
+            line += ellipsis;
+            if (line.size() == ellipsis.size() || fitsLine(line)) break;
+            line.resize(line.size() - ellipsis.size() - 1);
+        }
+    }
+
+    if (separator) message += L'\n';
+    message += line;
+    return true;
+}
+
+template <typename FitsLine>
+std::wstring FormatOverlapLines(std::span<const tagsearch::TagWindowBounds> windows,
+                                std::span<const TagGroup> groups, std::size_t limit, const FitsLine& fitsLine) {
     std::wstring message;
     for (const auto& group : groups) {
-        const std::size_t separator = message.empty() ? 0 : 1;
-        const std::size_t available = limit - message.size();
-        if (available < separator + ellipsis.size()) break;
-
         std::wstring line;
         for (const auto index : group) {
             if (!line.empty()) line += L'·';
             line += windows[index].tag;
         }
-        std::replace_if(line.begin(), line.end(), [](wchar_t ch) {
-            return ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == 0x2028 || ch == 0x2029;
-        }, L' ');
-
-        const auto lineLimit = available - separator;
-        if (line.size() > lineLimit || !fitsLine(line)) {
-            line.resize(std::min(line.size(), lineLimit - ellipsis.size()));
-            for (;;) {
-                if (!line.empty() && ((line.back() >= 0xd800 && line.back() <= 0xdbff) || line.back() == L'·')) {
-                    line.pop_back();
-                    continue;
-                }
-                line += ellipsis;
-                if (line.size() == ellipsis.size() || fitsLine(line)) break;
-                line.resize(line.size() - ellipsis.size() - 1);
-            }
-        }
-
-        if (separator) message += L'\n';
-        message += line;
+        if (!AppendNoticeLine(message, std::move(line), limit, fitsLine)) break;
     }
     return message;
 }
 
-std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindowBounds> windows,
-                               std::span<const TagGroup> groups, std::size_t limit) {
+template <typename FormatBody>
+std::wstring MeasureNoticeLines(HWND window, const FormatBody& formatBody) {
     const UINT dpi = WindowDpi(window);
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     const HFONT font = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)
@@ -371,7 +377,7 @@ std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindow
     const auto original = dc && font ? SelectObject(dc, font) : nullptr;
     // Leave room for the Shell's icon and margins.
     const int lineWidth = Scale(220, dpi);
-    const auto message = FormatOverlapLines(windows, groups, limit, [&](std::wstring_view line) {
+    const auto message = formatBody([&](std::wstring_view line) {
         SIZE text{};
         if (dc && GetTextExtentPoint32W(dc, line.data(), static_cast<int>(line.size()), &text)) {
             return text.cx <= lineWidth;
@@ -384,6 +390,13 @@ std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindow
     }
     if (font) DeleteObject(font);
     return message;
+}
+
+std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindowBounds> windows,
+                               std::span<const TagGroup> groups, std::size_t limit) {
+    return MeasureNoticeLines(window, [&](const auto& fitsLine) {
+        return FormatOverlapLines(windows, groups, limit, fitsLine);
+    });
 }
 
 void ShowNotice(Caption& caption, UINT& icon, const std::wstring& title, std::wstring body) {
@@ -432,32 +445,43 @@ void UpdateOverlapNotice(Caption& caption, bool initialLayout = false) {
     ShowNotice(caption, caption.overlapIcon, title, std::move(body));
 }
 
-void AppendFolderName(std::wstring& names, std::filesystem::path folder) {
-    folder = folder.lexically_normal();
-    if (folder.filename() == L"." || folder.filename() == L"..") {
-        std::error_code error;
-        const auto absolute = std::filesystem::absolute(folder, error);
-        if (!error) folder = absolute.lexically_normal();
-    }
-    if (!folder.has_filename() && folder.has_relative_path()) folder = folder.parent_path();
-
-    if (!names.empty()) names += L'·';
-    const auto name = folder.filename();
-    names += (name.empty() ? folder : name).wstring();
-}
-
-std::wstring ScanFolderNames(const wchar_t* commandLine, std::span<const std::filesystem::path> defaults) {
+tagsearch::Folders ScanNoticeFolders(const wchar_t* commandLine, std::span<const std::filesystem::path> defaults) {
     int count = 0;
     const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
         CommandLineToArgvW(commandLine, &count), &LocalFree);
-    std::wstring names;
+    tagsearch::Folders folders;
     for (int i = 1; arguments && i < count; ++i) {
-        if (arguments.get()[i][0] != L'\0') AppendFolderName(names, arguments.get()[i]);
-    }
-    if (!names.empty()) return names;
+        const std::filesystem::path input(arguments.get()[i]);
+        if (input.empty()) continue;
 
-    for (const auto& folder : defaults) AppendFolderName(names, folder);
-    return names.empty() ? L"Desktop·Downloads" : names;
+        std::error_code error;
+        auto absolute = std::filesystem::absolute(input, error);
+        auto folder = (error ? input : absolute).lexically_normal();
+        folder.make_preferred();
+        if (!folder.has_filename() && folder.has_relative_path()) folder = folder.parent_path();
+        folders.push_back(std::move(folder));
+    }
+    if (folders.empty()) folders.assign(defaults.begin(), defaults.end());
+    return folders;
+}
+
+template <typename FitsLine>
+std::wstring FormatFolderNoticeLines(std::span<const std::filesystem::path> folders,
+                                     std::size_t limit, const FitsLine& fitsLine) {
+    std::wstring message;
+    for (const auto& folder : folders) {
+        const auto name = folder.filename();
+        auto line = (name.empty() ? folder : name).wstring() + L'-' + folder.wstring();
+        if (!AppendNoticeLine(message, std::move(line), limit, fitsLine)) break;
+    }
+    return message;
+}
+
+std::wstring ScanNoticeBody(HWND window, const tagsearch::Folders& folders) {
+    if (folders.empty()) return L"没有可读取的默认目录";
+    return MeasureNoticeLines(window, [&](const auto& fitsLine) {
+        return FormatFolderNoticeLines(folders, kNoticeBodyLimit, fitsLine);
+    });
 }
 
 bool PastDragThreshold(HWND window, const FloatingTag& tag, POINT point) {
@@ -680,7 +704,7 @@ void ActivateTags(Caption& caption) {
     if (!windows.empty()) SetForegroundWindow(windows.front());
 }
 
-void ScanInBackground(Caption& caption, std::promise<std::wstring>& folderNames, std::stop_token stop) {
+void ScanInBackground(Caption& caption, std::promise<tagsearch::Folders>& noticeFolders, std::stop_token stop) {
     auto& scan = caption.scan;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         try {
@@ -688,7 +712,7 @@ void ScanInBackground(Caption& caption, std::promise<std::wstring>& folderNames,
             std::size_t defaultCount = 0;
             scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount);
             if (!stop.stop_requested()) {
-                folderNames.set_value(ScanFolderNames(commandLine, std::span(scan.folders).first(defaultCount)));
+                noticeFolders.set_value(ScanNoticeFolders(commandLine, std::span(scan.folders).first(defaultCount)));
                 PostMessageW(caption.controller, kScanStarted, 0, 0);
                 scan.tags = tagsearch::ScanTags(scan.folders, stop);
                 scan.success = !stop.stop_requested();
@@ -704,10 +728,10 @@ void ScanInBackground(Caption& caption, std::promise<std::wstring>& folderNames,
 
 bool StartStartupScan(Caption& caption) {
     try {
-        std::promise<std::wstring> folderNames;
-        caption.scanFolderNames = folderNames.get_future();
-        caption.scanner = std::jthread([&caption, folderNames = std::move(folderNames)](std::stop_token stop) mutable {
-            ScanInBackground(caption, folderNames, stop);
+        std::promise<tagsearch::Folders> noticeFolders;
+        caption.scanNoticeFolders = noticeFolders.get_future();
+        caption.scanner = std::jthread([&caption, noticeFolders = std::move(noticeFolders)](std::stop_token stop) mutable {
+            ScanInBackground(caption, noticeFolders, stop);
         });
     } catch (const std::system_error&) {
         return false;
@@ -756,8 +780,9 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
     switch (message) {
     case kScanStarted:
-        if (caption->scanFolderNames.valid()) {
-            ShowNotice(*caption, caption->scanIcon, L"正在读取标签…", caption->scanFolderNames.get());
+        if (caption->scanNoticeFolders.valid()) {
+            ShowNotice(*caption, caption->scanIcon, L"正在读取标签…",
+                       ScanNoticeBody(window, caption->scanNoticeFolders.get()));
         }
         return 0;
     case kScanComplete:
