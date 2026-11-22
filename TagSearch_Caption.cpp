@@ -1,14 +1,21 @@
-#ifdef TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
-#include "tests/TagSearch_Layout.h"
-#else
 #include "TagSearch_Core.h"
-#endif
+
+#include <propkey.h>
+#include <propvarutil.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cwchar>
+#include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace tagsearch {
@@ -142,20 +149,156 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
     return CountOverlappingWindows(bounds);
 }
 
+namespace {
+
+std::wstring_view TrimIniValue(std::wstring_view value) {
+    const auto first = value.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring_view::npos) return {};
+    return value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+}
+
+std::wstring ReadIconIniValue(const std::filesystem::path& ini, const wchar_t* key) {
+    constexpr DWORD maxLength = 32768;
+    for (DWORD capacity = 512; capacity <= maxLength; capacity *= 2) {
+        std::wstring value(capacity, L'\0');
+        const DWORD length = GetPrivateProfileStringW(
+            L".ShellClassInfo", key, L"", value.data(), capacity, ini.c_str());
+        if (length < capacity - 1) {
+            value.resize(length);
+            return value;
+        }
+    }
+    return {};
+}
+
+std::optional<int> ParseIconIndex(std::wstring_view text) {
+    const std::wstring value(TrimIniValue(text));
+    wchar_t* end = nullptr;
+    const auto index = std::wcstoll(value.c_str(), &end, 10);
+    if (!end || end == value.c_str() || *end || index < std::numeric_limits<int>::min() ||
+        index > std::numeric_limits<int>::max()) return std::nullopt;
+    return static_cast<int>(index);
+}
+
+} // namespace
+
+std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder) {
+    const auto ini = folder / L"desktop.ini";
+    auto value = ReadIconIniValue(ini, L"IconResource");
+    int index = 0;
+    if (value.empty()) {
+        value = ReadIconIniValue(ini, L"IconFile");
+        index = ParseIconIndex(ReadIconIniValue(ini, L"IconIndex")).value_or(0);
+    } else if (const auto comma = value.rfind(L','); comma != std::wstring::npos) {
+        if (const auto parsed = ParseIconIndex(std::wstring_view(value).substr(comma + 1))) {
+            index = *parsed;
+            value.resize(comma);
+        }
+    }
+
+    auto path = TrimIniValue(value);
+    if (path.size() > 1 && path.front() == L'"' && path.back() == L'"') {
+        path = path.substr(1, path.size() - 2);
+    }
+    if (path.empty()) return std::nullopt;
+
+    const std::wstring input(path);
+    const DWORD capacity = ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
+    if (!capacity || capacity > 32768) return std::nullopt;
+    std::wstring expanded(capacity, L'\0');
+    const DWORD length = ExpandEnvironmentStringsW(input.c_str(), expanded.data(), capacity);
+    if (!length || length > capacity) return std::nullopt;
+    expanded.resize(length - 1);
+
+    return std::pair{(folder / expanded).lexically_normal(), index};
+}
+
+std::span<const std::filesystem::path> CaptionNoticeIconFolders(
+    std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments) {
+    return hasFolderArguments ? folders.subspan(defaultCount) : folders.first(defaultCount);
+}
+
+HICON CreateCaptionNoticeTransportIcon() {
+    constexpr int size = 16;
+    using Mask = std::array<BYTE, size * size / 8>;
+    Mask andMask{};
+    andMask.fill(0xff);
+    const Mask xorMask{};
+    return CreateIcon(GetModuleHandleW(nullptr), size, size, 1, 1, andMask.data(), xorMask.data());
+}
+
+void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon, HICON transportIcon) {
+    // Explorer needs a tray entry to send the balloon, even for NIIF_NONE.
+    notice.hIcon = icon ? icon : transportIcon;
+    notice.hBalloonIcon = icon;
+    notice.dwInfoFlags = icon ? NIIF_USER : NIIF_NONE;
+    if (notice.hIcon) notice.uFlags |= NIF_ICON;
+    else notice.uFlags &= ~NIF_ICON;
+
+    const auto iconHandle = reinterpret_cast<LPARAM>(icon);
+    SendMessageW(notice.hWnd, WM_SETICON, ICON_SMALL, iconHandle);
+    SendMessageW(notice.hWnd, WM_SETICON, ICON_BIG, iconHandle);
+}
+
+namespace {
+constexpr wchar_t kCaptionAppId[] = L"TagSearch.Caption";
+}
+
+HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::filesystem::path& shortcut,
+                             const std::pair<std::filesystem::path, int>& icon) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IShellLinkW> link;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(link.GetAddressOf()));
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IPersistFile> file;
+    hr = link.As(&file);
+    if (FAILED(hr)) return hr;
+
+    std::error_code error;
+    const bool existing = std::filesystem::exists(shortcut, error);
+    if (error) return E_FAIL;
+    if (existing) {
+        std::wstring target(32768, L'\0');
+        hr = file->Load(shortcut.c_str(), STGM_READWRITE);
+        if (FAILED(hr)) return hr;
+        hr = link->GetPath(target.data(), static_cast<int>(target.size()), nullptr, 0);
+        if (FAILED(hr)) return hr;
+        if (!std::filesystem::equivalent(target.c_str(), executable, error)) {
+            return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+        }
+    }
+
+    hr = link->SetPath(executable.c_str());
+    if (SUCCEEDED(hr)) hr = link->SetWorkingDirectory(executable.parent_path().c_str());
+    if (SUCCEEDED(hr)) hr = link->SetIconLocation(icon.first.c_str(), icon.second);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IPropertyStore> properties;
+    hr = link.As(&properties);
+    if (FAILED(hr)) return hr;
+    PROPVARIANT appId{};
+    hr = InitPropVariantFromString(kCaptionAppId, &appId);
+    if (SUCCEEDED(hr)) hr = properties->SetValue(PKEY_AppUserModel_ID, appId);
+    PropVariantClear(&appId);
+    if (SUCCEEDED(hr)) hr = properties->Commit();
+    if (SUCCEEDED(hr)) hr = file->Save(shortcut.c_str(), TRUE);
+    return hr;
+}
+
 } // namespace tagsearch
 
 #ifndef TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
 
 #include <dwmapi.h>
-#include <shellapi.h>
 #include <windowsx.h>
-#include <cwchar>
+#include <future>
 #include <iterator>
 #include <memory>
-#include <optional>
 #include <system_error>
 #include <thread>
-#include <utility>
+#include <type_traits>
 
 // Each executable supplies this externally linked entry point for the CRT.
 int WINAPI wWinMain(
@@ -172,8 +315,10 @@ constexpr wchar_t kMutexName[] = L"Local\\TagSearch.Caption.AEF63BC1-F7FC-4837-B
 constexpr UINT kActivate = WM_APP + 1;
 constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
-constexpr UINT kOverlapNotice = WM_APP + 4;
+constexpr UINT kNoticeEvent = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
+constexpr UINT kScanStarted = WM_APP + 6;
+constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
 constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW;
 using tagsearch::TagOperator;
@@ -211,28 +356,97 @@ struct ScanResult {
     bool success = false;
 };
 
+using IconResource = std::pair<std::filesystem::path, int>;
+using OwnedIcon = std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)>;
+using NoticeIcons = std::map<IconResource, OwnedIcon>;
+
+struct ScanNoticeData {
+    tagsearch::Folders folders;
+    NoticeIcons icons;
+};
+
+OwnedIcon ExtractCaptionIcon(const IconResource& resource) {
+    HICON icon = nullptr;
+    ExtractIconExW(resource.first.c_str(), resource.second, nullptr, &icon, 1);
+    return OwnedIcon(icon, &DestroyIcon);
+}
+
+void RegisterCaptionShortcut() {
+    std::wstring executableName(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, executableName.data(), static_cast<DWORD>(executableName.size()));
+    if (!length || length >= executableName.size()) return;
+    executableName.resize(length);
+    const std::filesystem::path executable(executableName);
+    const auto resource = tagsearch::ReadCaptionIconResource(executable.parent_path());
+    if (!resource || !ExtractCaptionIcon(*resource)) return;
+
+    PWSTR programs = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs);
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> programsPath(programs, &CoTaskMemFree);
+    if (FAILED(result) || !programsPath) return;
+
+    auto shortcut = std::filesystem::path(programsPath.get()) / executable.filename();
+    shortcut.replace_extension(L".lnk");
+    if (SUCCEEDED(tagsearch::SaveCaptionShortcut(executable, shortcut, *resource))) {
+        SetCurrentProcessExplicitAppUserModelID(tagsearch::kCaptionAppId);
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, shortcut.c_str(), nullptr);
+    }
+}
+
+NoticeIcons LoadNoticeIcons(std::span<const std::filesystem::path> folders, std::stop_token stop) {
+    NoticeIcons icons;
+    for (const auto& folder : folders) {
+        if (stop.stop_requested()) break;
+        auto resource = tagsearch::ReadCaptionIconResource(folder);
+        if (!resource || icons.contains(*resource)) continue;
+
+        auto icon = ExtractCaptionIcon(*resource);
+        if (icon) icons.emplace(std::move(*resource), std::move(icon));
+    }
+    return icons;
+}
+
 struct Caption {
     HINSTANCE instance;
     HWND controller = nullptr;
     std::vector<std::unique_ptr<FloatingTag>> tags;
     std::mt19937 random{std::random_device{}()};
     tagsearch::Folders folders;
+    UINT scanIcon = 0;
     UINT overlapIcon = 0;
-    UINT lastOverlapIcon = 0;
+    UINT lastNoticeIcon = 0;
+    bool exitAfterNotices = false;
     ScanResult scan;
+    NoticeIcons noticeIcons;
+    OwnedIcon noticeTransportIcon{tagsearch::CreateCaptionNoticeTransportIcon(), &DestroyIcon};
+    std::future<ScanNoticeData> scanNotice;
     std::jthread scanner;
 
-    void DismissOverlapNotice() {
-        if (!overlapIcon) return;
+    void DismissNotice(UINT& icon) {
+        if (!icon) return;
         NOTIFYICONDATAW notice{sizeof(notice)};
         notice.hWnd = controller;
-        notice.uID = std::exchange(overlapIcon, 0);
+        notice.uID = std::exchange(icon, 0);
         Shell_NotifyIconW(NIM_DELETE, &notice);
         KillTimer(controller, notice.uID);
     }
 
+    void QuitIfNoNotices() const {
+        if (exitAfterNotices && !scanIcon && !overlapIcon) PostQuitMessage(0);
+    }
+
+    bool FinishNotice(UINT icon) {
+        if (!icon) return false;
+        if (icon == scanIcon) DismissNotice(scanIcon);
+        else if (icon == overlapIcon) DismissNotice(overlapIcon);
+        else return false;
+        QuitIfNoNotices();
+        return true;
+    }
+
     ~Caption() {
-        DismissOverlapNotice();
+        DismissNotice(scanIcon);
+        DismissNotice(overlapIcon);
         if (controller) DestroyWindow(controller);
     }
 };
@@ -306,46 +520,52 @@ std::vector<TagGroup> OverlapGroups(std::span<const tagsearch::TagWindowBounds> 
 }
 
 template <typename FitsLine>
-std::wstring FormatOverlapLines(std::span<const tagsearch::TagWindowBounds> windows,
-                                std::span<const TagGroup> groups, std::size_t limit, FitsLine fitsLine) {
+bool AppendNoticeLine(std::wstring& message, std::wstring line, std::size_t limit, const FitsLine& fitsLine) {
     constexpr std::wstring_view ellipsis = L"...";
+    const std::size_t separator = message.empty() ? 0 : 1;
+    const std::size_t available = limit - message.size();
+    if (available < separator + ellipsis.size()) return false;
+
+    std::replace_if(line.begin(), line.end(), [](wchar_t ch) {
+        return ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == 0x2028 || ch == 0x2029;
+    }, L' ');
+
+    const auto lineLimit = available - separator;
+    if (line.size() > lineLimit || !fitsLine(line)) {
+        line.resize(std::min(line.size(), lineLimit - ellipsis.size()));
+        for (;;) {
+            if (!line.empty() && ((line.back() >= 0xd800 && line.back() <= 0xdbff) || line.back() == L'·')) {
+                line.pop_back();
+                continue;
+            }
+            line += ellipsis;
+            if (line.size() == ellipsis.size() || fitsLine(line)) break;
+            line.resize(line.size() - ellipsis.size() - 1);
+        }
+    }
+
+    if (separator) message += L'\n';
+    message += line;
+    return true;
+}
+
+template <typename FitsLine>
+std::wstring FormatOverlapLines(std::span<const tagsearch::TagWindowBounds> windows,
+                                std::span<const TagGroup> groups, std::size_t limit, const FitsLine& fitsLine) {
     std::wstring message;
     for (const auto& group : groups) {
-        const std::size_t separator = message.empty() ? 0 : 1;
-        const std::size_t available = limit - message.size();
-        if (available < separator + ellipsis.size()) break;
-
         std::wstring line;
         for (const auto index : group) {
             if (!line.empty()) line += L'·';
             line += windows[index].tag;
         }
-        std::replace_if(line.begin(), line.end(), [](wchar_t ch) {
-            return ch == L'\r' || ch == L'\n' || ch == L'\t' || ch == 0x2028 || ch == 0x2029;
-        }, L' ');
-
-        const auto lineLimit = available - separator;
-        if (line.size() > lineLimit || !fitsLine(line)) {
-            line.resize(std::min(line.size(), lineLimit - ellipsis.size()));
-            for (;;) {
-                if (!line.empty() && ((line.back() >= 0xd800 && line.back() <= 0xdbff) || line.back() == L'·')) {
-                    line.pop_back();
-                    continue;
-                }
-                line += ellipsis;
-                if (line.size() == ellipsis.size() || fitsLine(line)) break;
-                line.resize(line.size() - ellipsis.size() - 1);
-            }
-        }
-
-        if (separator) message += L'\n';
-        message += line;
+        if (!AppendNoticeLine(message, std::move(line), limit, fitsLine)) break;
     }
     return message;
 }
 
-std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindowBounds> windows,
-                               std::span<const TagGroup> groups, std::size_t limit) {
+template <typename FormatBody>
+std::wstring MeasureNoticeLines(HWND window, const FormatBody& formatBody) {
     const UINT dpi = WindowDpi(window);
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     const HFONT font = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)
@@ -354,7 +574,7 @@ std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindow
     const auto original = dc && font ? SelectObject(dc, font) : nullptr;
     // Leave room for the Shell's icon and margins.
     const int lineWidth = Scale(220, dpi);
-    const auto message = FormatOverlapLines(windows, groups, limit, [&](std::wstring_view line) {
+    const auto message = formatBody([&](std::wstring_view line) {
         SIZE text{};
         if (dc && GetTextExtentPoint32W(dc, line.data(), static_cast<int>(line.size()), &text)) {
             return text.cx <= lineWidth;
@@ -369,35 +589,99 @@ std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindow
     return message;
 }
 
-void UpdateOverlapNotice(Caption& caption) {
-    const auto windows = VisibleTagsInZOrder(caption);
-    const auto groups = OverlapGroups(windows);
-    caption.DismissOverlapNotice();
-    if (groups.empty()) return;
+std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindowBounds> windows,
+                               std::span<const TagGroup> groups, std::size_t limit) {
+    return MeasureNoticeLines(window, [&](const auto& fitsLine) {
+        return FormatOverlapLines(windows, groups, limit, fitsLine);
+    });
+}
+
+void ShowNotice(Caption& caption, UINT& icon, const std::wstring& title, std::wstring body) {
+    caption.DismissNotice(icon);
+    if (body.size() > kNoticeBodyLimit) {
+        body.resize(kNoticeBodyLimit - 3);
+        if (body.back() >= 0xd800 && body.back() <= 0xdbff) body.pop_back();
+        body += L"...";
+    }
 
     NOTIFYICONDATAW notice{sizeof(notice)};
     notice.hWnd = caption.controller;
-    // A queued callback from an older balloon must not dismiss this one.
-    caption.lastOverlapIcon = caption.lastOverlapIcon % 0xffff + 1;
-    notice.uID = caption.lastOverlapIcon;
-    notice.uFlags = NIF_ICON | NIF_MESSAGE;
-    notice.uCallbackMessage = kOverlapNotice;
-    notice.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // A queued callback from an older balloon must not dismiss a newer one.
+    caption.lastNoticeIcon = caption.lastNoticeIcon % 0xffff + 1;
+    notice.uID = caption.lastNoticeIcon;
+    notice.uFlags = NIF_MESSAGE;
+    notice.uCallbackMessage = kNoticeEvent;
+    HICON iconForNotice = nullptr;
+    if (!caption.noticeIcons.empty()) {
+        const auto offset = std::uniform_int_distribution<std::size_t>(0, caption.noticeIcons.size() - 1)(caption.random);
+        iconForNotice = std::next(caption.noticeIcons.begin(), static_cast<std::ptrdiff_t>(offset))->second.get();
+    }
+    tagsearch::ConfigureCaptionNoticeIcon(notice, iconForNotice, caption.noticeTransportIcon.get());
     if (!Shell_NotifyIconW(NIM_ADD, &notice)) return;
 
-    caption.overlapIcon = notice.uID;
+    icon = notice.uID;
     notice.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &notice);
     notice.uFlags = NIF_INFO;
-    notice.dwInfoFlags = NIIF_INFO;
-    const auto title = L"重叠标签组 「" + std::to_wstring(groups.size()) + L"」";
     wcscpy_s(notice.szInfoTitle, title.c_str());
-    const auto message = OverlapNoticeBody(caption.controller, windows, groups, std::size(notice.szInfo) - 1);
-    wcscpy_s(notice.szInfo, message.c_str());
+    wcscpy_s(notice.szInfo, body.c_str());
     if (!Shell_NotifyIconW(NIM_MODIFY, &notice) ||
         !SetTimer(caption.controller, notice.uID, 60000, nullptr)) {
-        caption.DismissOverlapNotice();
+        caption.DismissNotice(icon);
     }
+}
+
+void UpdateOverlapNotice(Caption& caption, bool initialLayout = false) {
+    const auto windows = VisibleTagsInZOrder(caption);
+    const auto groups = OverlapGroups(windows);
+    if (groups.empty() && !initialLayout) {
+        caption.DismissNotice(caption.overlapIcon);
+        return;
+    }
+
+    const auto title = L"重叠标签组 「" + std::to_wstring(groups.size()) + L"」";
+    auto body = groups.empty()
+        ? L"统计标记数量 「" + std::to_wstring(caption.tags.size()) + L"」"
+        : OverlapNoticeBody(caption.controller, windows, groups, kNoticeBodyLimit);
+    ShowNotice(caption, caption.overlapIcon, title, std::move(body));
+}
+
+tagsearch::Folders ScanNoticeArguments(const wchar_t* commandLine) {
+    int count = 0;
+    const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
+        CommandLineToArgvW(commandLine, &count), &LocalFree);
+    tagsearch::Folders folders;
+    for (int i = 1; arguments && i < count; ++i) {
+        const std::filesystem::path input(arguments.get()[i]);
+        if (input.empty()) continue;
+
+        std::error_code error;
+        auto absolute = std::filesystem::absolute(input, error);
+        auto folder = (error ? input : absolute).lexically_normal();
+        folder.make_preferred();
+        if (!folder.has_filename() && folder.has_relative_path()) folder = folder.parent_path();
+        folders.push_back(std::move(folder));
+    }
+    return folders;
+}
+
+template <typename FitsLine>
+std::wstring FormatFolderNoticeLines(std::span<const std::filesystem::path> folders,
+                                     std::size_t limit, const FitsLine& fitsLine) {
+    std::wstring message;
+    for (const auto& folder : folders) {
+        const auto name = folder.filename();
+        auto line = (name.empty() ? folder : name).wstring() + L'-' + folder.wstring();
+        if (!AppendNoticeLine(message, std::move(line), limit, fitsLine)) break;
+    }
+    return message;
+}
+
+std::wstring ScanNoticeBody(HWND window, const tagsearch::Folders& folders) {
+    if (folders.empty()) return L"没有可读取的默认目录";
+    return MeasureNoticeLines(window, [&](const auto& fitsLine) {
+        return FormatFolderNoticeLines(folders, kNoticeBodyLimit, fitsLine);
+    });
 }
 
 bool PastDragThreshold(HWND window, const FloatingTag& tag, POINT point) {
@@ -559,7 +843,7 @@ std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& tex
     return tag->window ? std::move(tag) : nullptr;
 }
 
-bool PositionTags(Caption& caption) {
+bool PositionTags(Caption& caption, bool firstShow = false) {
     const RECT work = PrimaryWorkArea();
     if (IsRectEmpty(&work)) return false;
     SetWindowPos(caption.controller, nullptr, work.left, work.top, 0, 0,
@@ -592,10 +876,12 @@ bool PositionTags(Caption& caption) {
     std::vector<RECT> bounds(widths.size());
     const LONG height = frame.bottom - frame.top;
     tagsearch::LayoutCaptionWindows(work, widths, height, bounds, caption.random);
+    // On first display, place and show each tag without requesting foreground activation.
+    const UINT flags = SWP_NOACTIVATE | (firstShow ? SWP_SHOWWINDOW | SWP_NOOWNERZORDER : SWP_NOZORDER);
     for (std::size_t i = 0; i < bounds.size(); ++i) {
         const auto& rect = bounds[i];
-        if (!SetWindowPos(caption.tags[i]->window, nullptr, rect.left, rect.top,
-                          rect.right - rect.left, rect.bottom - rect.top, SWP_NOACTIVATE | SWP_NOZORDER)) {
+        if (!SetWindowPos(caption.tags[i]->window, firstShow ? HWND_TOP : nullptr, rect.left, rect.top,
+                          rect.right - rect.left, rect.bottom - rect.top, flags)) {
             return false;
         }
     }
@@ -620,13 +906,24 @@ void ActivateTags(Caption& caption) {
     if (!windows.empty()) SetForegroundWindow(windows.front());
 }
 
-void ScanInBackground(Caption& caption, std::stop_token stop) {
+void ScanInBackground(Caption& caption, std::promise<ScanNoticeData>& notice, std::stop_token stop) {
     auto& scan = caption.scan;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         try {
-            scan.folders = tagsearch::ResolveSearchFolders(GetCommandLineW());
-            scan.tags = tagsearch::ScanTags(scan.folders, stop);
-            scan.success = !stop.stop_requested();
+            const auto commandLine = GetCommandLineW();
+            std::size_t defaultCount = 0;
+            scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount);
+            if (!stop.stop_requested()) {
+                const std::span<const std::filesystem::path> folders = scan.folders;
+                auto displayFolders = ScanNoticeArguments(commandLine);
+                const bool hasFolderArguments = !displayFolders.empty();
+                const auto iconFolders = tagsearch::CaptionNoticeIconFolders(folders, defaultCount, hasFolderArguments);
+                if (!hasFolderArguments) displayFolders.assign(iconFolders.begin(), iconFolders.end());
+                notice.set_value({std::move(displayFolders), LoadNoticeIcons(iconFolders, stop)});
+                PostMessageW(caption.controller, kScanStarted, 0, 0);
+                scan.tags = tagsearch::ScanTags(scan.folders, stop);
+                scan.success = !stop.stop_requested();
+            }
         } catch (...) {
             scan.success = false;
         }
@@ -638,8 +935,10 @@ void ScanInBackground(Caption& caption, std::stop_token stop) {
 
 bool StartStartupScan(Caption& caption) {
     try {
-        caption.scanner = std::jthread([&caption](std::stop_token stop) {
-            ScanInBackground(caption, stop);
+        std::promise<ScanNoticeData> notice;
+        caption.scanNotice = notice.get_future();
+        caption.scanner = std::jthread([&caption, notice = std::move(notice)](std::stop_token stop) mutable {
+            ScanInBackground(caption, notice, stop);
         });
     } catch (const std::system_error&) {
         return false;
@@ -666,16 +965,13 @@ void ShowScanResult(Caption& caption) {
         caption.tags.push_back(std::move(tag));
     }
     caption.scan = {};
-    if (caption.tags.empty()) {
-        PostQuitMessage(0);
-        return;
-    }
-    if (!PositionTags(caption)) {
+    if (!caption.tags.empty() && !PositionTags(caption, true)) {
         PostQuitMessage(1);
         return;
     }
-    ActivateTags(caption);
-    UpdateOverlapNotice(caption);
+    UpdateOverlapNotice(caption, true);
+    caption.exitAfterNotices = caption.tags.empty();
+    caption.QuitIfNoNotices();
 }
 
 LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -687,6 +983,13 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     if (!caption) return DefWindowProcW(window, message, wParam, lParam);
 
     switch (message) {
+    case kScanStarted:
+        if (caption->scanNotice.valid()) {
+            auto notice = caption->scanNotice.get();
+            caption->noticeIcons = std::move(notice.icons);
+            ShowNotice(*caption, caption->scanIcon, L"正在读取标签…", ScanNoticeBody(window, notice.folders));
+        }
+        return 0;
     case kScanComplete:
         ShowScanResult(*caption);
         return 0;
@@ -703,17 +1006,15 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case kReflow:
         if (!caption->tags.empty()) PositionTags(*caption);
         return 0;
-    case kOverlapNotice:
-        if (HIWORD(lParam) == caption->overlapIcon &&
-            (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT ||
-             LOWORD(lParam) == NIN_BALLOONUSERCLICK)) {
-            caption->DismissOverlapNotice();
+    case kNoticeEvent:
+        if (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT ||
+            LOWORD(lParam) == NIN_BALLOONUSERCLICK) {
+            caption->FinishNotice(HIWORD(lParam));
         }
         return 0;
     case WM_TIMER:
-        if (wParam != caption->overlapIcon) break;
-        caption->DismissOverlapNotice();
-        return 0;
+        if (caption->FinishNotice(static_cast<UINT>(wParam))) return 0;
+        break;
     case WM_CLOSE:
         PostQuitMessage(0);
         return 0;
@@ -784,6 +1085,7 @@ int RunSingleInstance(HINSTANCE instance) {
 
     int result = 1;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        RegisterCaptionShortcut();
         result = Run(instance);
         CoUninitialize();
     }

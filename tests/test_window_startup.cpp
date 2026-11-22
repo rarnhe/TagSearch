@@ -1,5 +1,7 @@
 #include "TagSearch_Core.h"
 
+#include <commctrl.h>
+
 #include <propkey.h>
 #include <propvarutil.h>
 #include <shlobj.h>
@@ -197,6 +199,44 @@ void CheckFixedWindowAndTitle(const fs::path& executable) {
     ClosePanel(window, process);
 }
 
+void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
+    const TestCopy copy(executable);
+    fs::copy_file(fixture, copy.directory / L"tagged.jpg");
+    const Process process(copy.executable, {copy.directory});
+    const HWND panel = WaitForPanel(process);
+    WaitForTitle(panel, copy.directory.filename().wstring());
+    const HWND tree = FindWindowExW(panel, nullptr, WC_TREEVIEWW, nullptr);
+    if (!tree) throw std::runtime_error("the panel should contain a tree view");
+
+    RECT client{};
+    const auto count = SendMessageW(tree, TVM_GETCOUNT, 0, 0);
+    Expect(GetClientRect(tree, &client) && count > 0 &&
+           count < SendMessageW(tree, TVM_GETVISIBLECOUNT, 0, 0),
+           "the fixture should provide rows and a blank area below them");
+
+    const auto caret = [&] { return SendMessageW(tree, TVM_GETNEXTITEM, TVGN_CARET, 0); };
+    const auto clickBlank = [&] {
+        const auto point = MAKELPARAM(client.right / 2, client.bottom - 2);
+        DWORD_PTR result = 0;
+        Expect(SendMessageTimeoutW(tree, WM_LBUTTONDOWN, MK_LBUTTON, point, SMTO_ABORTIFHUNG, 1000, &result) &&
+               SendMessageTimeoutW(tree, WM_LBUTTONUP, 0, point, SMTO_ABORTIFHUNG, 1000, &result),
+               "the tree should handle a click in its blank area");
+    };
+
+    Expect(caret() == 0, "initial TreeView display should leave the caret unselected");
+    clickBlank();
+    Expect(caret() == 0, "a blank click should not select the first row");
+    DWORD_PTR result = 0;
+    Expect(SendMessageTimeoutW(panel, WM_KEYDOWN, VK_DOWN, 0, SMTO_ABORTIFHUNG, 1000, &result),
+           "keyboard navigation should enter the tree");
+    const auto selected = caret();
+    Expect(selected != 0, "keyboard navigation should still select a row");
+    clickBlank();
+    Expect(caret() == selected, "a blank click should preserve an existing selection");
+
+    ClosePanel(panel, process);
+}
+
 struct VisibleTags {
     HWND controller;
     bool unexpectedVisibleWindow = false;
@@ -300,6 +340,8 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
            "only real tag windows should be visible after the scan");
     CheckTagBounds(tags, monitor.rcWork);
     Expect(!HasIntersection(tags.bounds), "two short tags should fit without overlap");
+    Expect(std::find(tags.windows.begin(), tags.windows.end(), GetForegroundWindow()) == tags.windows.end(),
+           "initial Caption display should leave the foreground with the previous application");
 
     const auto originalWindows = tags.windows;
     const HWND tag = originalWindows.front();
@@ -391,6 +433,8 @@ int wmain(int argc, wchar_t** argv) {
             CheckStartup(argv[2]);
         } else if (mode == L"fixed-window" && argc == 3) {
             CheckFixedWindowAndTitle(argv[2]);
+        } else if (mode == L"treeview-blank-click" && argc == 4) {
+            CheckTreeBlankClick(argv[2], argv[3]);
         } else if (mode == L"caption" && argc == 4) {
             CheckCaptionLayout(argv[2], argv[3]);
         } else if (mode == L"caption-crowded" && argc == 4) {

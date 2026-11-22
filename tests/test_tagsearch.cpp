@@ -1,6 +1,7 @@
 #include "TagSearch_Core.h"
 #include "TagSearch_Layout.h"
 
+#include <propkey.h>
 #include <propvarutil.h>
 #include <shlobj.h>
 #include <structuredquery.h>
@@ -8,14 +9,27 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <optional>
+#include <shellapi.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace tagsearch {
+std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder);
+std::span<const std::filesystem::path> CaptionNoticeIconFolders(
+    std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments);
+HICON CreateCaptionNoticeTransportIcon();
+void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon, HICON transportIcon);
+HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::filesystem::path& shortcut,
+                             const std::pair<std::filesystem::path, int>& icon);
+}
 
 namespace {
 
@@ -288,6 +302,132 @@ std::size_t CountCaptionIntersections(std::span<const RECT> windows, const RECT&
     return count;
 }
 
+void CaptionReadsDesktopIniIconResource() {
+    TestDirectory test;
+    {
+        const std::wstring ini =
+            L"\ufeff[.ShellClassInfo]\r\nIconResource=\"icons\\标记, light.ico\", -7\r\n"
+            L"IconFile=ignored.ico\r\nIconIndex=1\r\n";
+        std::ofstream file(test.path / L"desktop.ini", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(ini.data()), static_cast<std::streamsize>(ini.size() * sizeof(wchar_t)));
+        Expect(file.good(), "the fixture should write a Unicode desktop.ini");
+    }
+
+    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    ExpectEqual(icon, std::optional{std::pair{test.path / L"icons" / L"标记, light.ico", -7}},
+                "IconResource should retain a quoted relative path and signed index");
+    Expect(!tagsearch::ReadCaptionIconResource(test.path / L"missing"),
+           "a folder without desktop.ini should not supply an icon");
+}
+
+void CaptionReadsLegacyDesktopIniIcon() {
+    TestDirectory test;
+    {
+        std::ofstream file(test.path / L"desktop.ini");
+        file << "[.ShellClassInfo]\nIconFile=%SystemRoot%\\System32\\shell32.dll\nIconIndex=0\n";
+        Expect(file.good(), "the fixture should write an ANSI desktop.ini");
+    }
+
+    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    if (!icon) throw std::runtime_error("IconFile and IconIndex should supply a resource");
+    Expect(icon->first.is_absolute() && icon->first.filename() == L"shell32.dll" && icon->second == 0,
+           "the legacy icon should expand Windows environment variables and retain its index");
+
+    HICON handle = nullptr;
+    ExtractIconExW(icon->first.c_str(), icon->second, nullptr, &handle, 1);
+    const bool extracted = handle != nullptr;
+    if (handle) DestroyIcon(handle);
+    Expect(extracted, "the returned location should load as a Win32 notification icon");
+}
+
+void CaptionNoticeMatchesSenderIconOrHasNone() {
+    const HICON icon = LoadIconW(nullptr, IDI_APPLICATION);
+    if (!icon) throw std::runtime_error("the test should load an icon");
+    const HWND owner = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
+        0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!owner) throw std::runtime_error("the test should create a hidden notification owner");
+
+    const HICON transportIcon = tagsearch::CreateCaptionNoticeTransportIcon();
+    if (!transportIcon) {
+        DestroyWindow(owner);
+        throw std::runtime_error("the test should create a transparent tray registration icon");
+    }
+    NOTIFYICONDATAW notice{sizeof(notice)};
+    notice.hWnd = owner;
+    notice.uFlags = NIF_MESSAGE;
+    tagsearch::ConfigureCaptionNoticeIcon(notice, icon, transportIcon);
+    const auto iconHandle = reinterpret_cast<LRESULT>(icon);
+    const bool matched = (notice.uFlags & NIF_ICON) && notice.dwInfoFlags == NIIF_USER &&
+        notice.hIcon == icon && notice.hBalloonIcon == icon &&
+        SendMessageW(owner, WM_GETICON, ICON_SMALL, 0) == iconHandle &&
+        SendMessageW(owner, WM_GETICON, ICON_BIG, 0) == iconHandle;
+
+    tagsearch::ConfigureCaptionNoticeIcon(notice, nullptr, transportIcon);
+    const bool removed = notice.uFlags == (NIF_MESSAGE | NIF_ICON) && notice.dwInfoFlags == NIIF_NONE &&
+        notice.hIcon == transportIcon && !notice.hBalloonIcon &&
+        SendMessageW(owner, WM_GETICON, ICON_SMALL, 0) == 0 &&
+        SendMessageW(owner, WM_GETICON, ICON_BIG, 0) == 0;
+    DestroyWindow(owner);
+    DestroyIcon(transportIcon);
+
+    Expect(matched, "the tray, notification and owner window should use the same icon");
+    Expect(removed, "the transparent tray icon should keep text-only notices registered");
+}
+
+void CaptionSelectsNoticeIconFoldersByArguments() {
+    const std::array<fs::path, 3> folders{L"Desktop", L"Downloads", L"Explicit"};
+    const auto defaults = tagsearch::CaptionNoticeIconFolders(folders, 2, false);
+    const auto explicitFolders = tagsearch::CaptionNoticeIconFolders(folders, 2, true);
+    Expect(defaults.size() == 2 && defaults.front() == L"Desktop" && defaults.back() == L"Downloads",
+           "launch without folder arguments should try the default folders");
+    Expect(explicitFolders.size() == 1 && explicitFolders.front() == L"Explicit",
+           "launch with folder arguments should try only non-default folders");
+    Expect(tagsearch::CaptionNoticeIconFolders(std::span(folders).first(2), 2, true).empty(),
+           "an explicit argument that adds no valid directory should still skip default icons");
+}
+
+void CaptionShortcutStoresIconAndAppId() {
+    TestDirectory test;
+    const auto executable = test.path / L"Caption.exe";
+    const auto shortcut = test.path / L"Caption.lnk";
+    const auto icon = std::pair{test.path / L"folder.ico", -9};
+    std::ofstream(executable).put('\0');
+    Expect(SUCCEEDED(tagsearch::SaveCaptionShortcut(executable, shortcut, icon)),
+           "the program should write a shortcut for its own executable");
+    const auto refreshed = tagsearch::SaveCaptionShortcut(executable, shortcut, icon);
+    if (FAILED(refreshed)) {
+        throw std::runtime_error("refreshing the program's own shortcut failed, HRESULT " +
+                                 std::to_string(static_cast<std::uint32_t>(refreshed)));
+    }
+
+    Microsoft::WRL::ComPtr<IShellLinkW> link;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(link.GetAddressOf())))) {
+        throw std::runtime_error("the test should open a shell link");
+    }
+    Microsoft::WRL::ComPtr<IPersistFile> file;
+    if (FAILED(link.As(&file)) || FAILED(file->Load(shortcut.c_str(), STGM_READ))) {
+        throw std::runtime_error("the saved shortcut should load");
+    }
+
+    std::array<wchar_t, MAX_PATH> savedIcon{};
+    int index = 0;
+    Expect(SUCCEEDED(link->GetIconLocation(savedIcon.data(), static_cast<int>(savedIcon.size()), &index)) &&
+           fs::path(savedIcon.data()) == icon.first && index == icon.second,
+           "the shortcut should retain the desktop.ini icon location and index");
+
+    Microsoft::WRL::ComPtr<IPropertyStore> properties;
+    if (FAILED(link.As(&properties))) throw std::runtime_error("the link should support properties");
+    PROPVARIANT value{};
+    const bool matches = SUCCEEDED(properties->GetValue(PKEY_AppUserModel_ID, &value)) &&
+                         value.vt == VT_LPWSTR && value.pwszVal &&
+                         std::wstring_view(value.pwszVal) == L"TagSearch.Caption";
+    PropVariantClear(&value);
+    Expect(matches, "the shortcut should retain Caption's AppUserModelID");
+    Expect(FAILED(tagsearch::SaveCaptionShortcut(test.path / L"Different.exe", shortcut, icon)),
+           "an existing link to a different executable should be left untouched");
+}
+
 void CaptionLayoutPacksVariableWidths() {
     const RECT work{-200, 30, 0, 80};
     const std::array<LONG, 6> widths{120, 120, 50, 50, 30, 30};
@@ -420,6 +560,11 @@ int main(int argc, char** argv) {
         {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
         {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
+        {"caption_reads_desktop_ini_icon_resource", CaptionReadsDesktopIniIconResource},
+        {"caption_reads_legacy_desktop_ini_icon", CaptionReadsLegacyDesktopIniIcon},
+        {"caption_notice_matches_sender_icon_or_has_none", CaptionNoticeMatchesSenderIconOrHasNone},
+        {"caption_selects_notice_icon_folders_by_arguments", CaptionSelectsNoticeIconFoldersByArguments},
+        {"caption_shortcut_stores_icon_and_app_id", CaptionShortcutStoresIconAndAppId},
         {"caption_layout_packs_variable_widths", CaptionLayoutPacksVariableWidths},
         {"caption_layout_keeps_all_crowded_windows_and_counts_overlap", CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap},
         {"caption_layout_randomizes_positions", CaptionLayoutRandomizesPositions},

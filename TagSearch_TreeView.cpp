@@ -137,12 +137,39 @@ void UpdateFont(HWND window, WindowState& state) {
     }
 }
 
-HTREEITEM ItemAt(HWND tree, POINT screenPoint) {
-    ScreenToClient(tree, &screenPoint);
+HTREEITEM ItemAt(HWND tree, POINT point) {
     TVHITTESTINFO hit{};
-    hit.pt = screenPoint;
+    hit.pt = point;
     TreeView_HitTest(tree, &hit);
     return (hit.flags & (TVHT_ONITEM | TVHT_ONITEMRIGHT)) ? hit.hItem : nullptr;
+}
+
+HTREEITEM ItemAtScreenPoint(HWND tree, POINT point) {
+    return ScreenToClient(tree, &point) ? ItemAt(tree, point) : nullptr;
+}
+
+LRESULT CALLBACK TreeMouseProc(HWND tree, UINT message, WPARAM wParam, LPARAM lParam,
+                               UINT_PTR subclassId, DWORD_PTR) {
+    switch (message) {
+    case WM_MOUSEACTIVATE: {
+        POINT point{};
+        if (LOWORD(lParam) == HTCLIENT && GetCursorPos(&point) && !ItemAtScreenPoint(tree, point)) {
+            return MA_NOACTIVATE;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDBLCLK:
+        // The native control can move its caret to the first row when a blank click gives it focus.
+        if (!ItemAt(tree, {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) return 0;
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(tree, TreeMouseProc, subclassId);
+        break;
+    }
+    return DefSubclassProc(tree, message, wParam, lParam);
 }
 
 void SearchItem(HWND window, const WindowState& state, HTREEITEM item) {
@@ -206,7 +233,9 @@ void ActivateWindow(HWND window, WindowState& state) {
     }
     SetWindowPos(window, HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    if (SetForegroundWindow(window)) SetFocus(state.tree);
+    if (SetForegroundWindow(window)) {
+        SetFocus(TreeView_GetSelection(state.tree) ? state.tree : window);
+    }
 }
 
 std::wstring FolderTitle(const Folders& folders, std::size_t defaultCount) {
@@ -263,7 +292,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         state->tree = CreateWindowExW(0, WC_TREEVIEWW, L"",
             WS_CHILD | WS_VISIBLE | TVS_SHOWSELALWAYS | TVS_FULLROWSELECT,
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
-        if (!state->tree) return -1;
+        if (!state->tree || !SetWindowSubclass(state->tree, TreeMouseProc, 0, 0)) return -1;
         UpdateFont(window, *state);
         LayoutTree(window, *state);
 
@@ -323,12 +352,25 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETWORKAREA) UpdateDock(window, *state, GetDpiForWindow(window));
         break;
+    case WM_KEYDOWN:
+        if (wParam == VK_TAB || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_HOME ||
+            wParam == VK_END || wParam == VK_PRIOR || wParam == VK_NEXT) {
+            const auto previous = TreeView_GetSelection(state->tree);
+            SetFocus(state->tree);
+            const bool firstArrow = !previous && (wParam == VK_UP || wParam == VK_DOWN);
+            // If focusing an empty caret already selected the first row, do not advance again.
+            if (wParam != VK_TAB && (!firstArrow || !TreeView_GetSelection(state->tree))) {
+                SendMessageW(state->tree, message, wParam, lParam);
+            }
+            return 0;
+        }
+        break;
     case WM_NOTIFY: {
         const auto* notice = reinterpret_cast<const NMHDR*>(lParam);
         if (notice->hwndFrom != state->tree) break;
         if (notice->code == NM_CLICK) {
             POINT point{};
-            if (GetCursorPos(&point)) SearchItem(window, *state, ItemAt(state->tree, point));
+            if (GetCursorPos(&point)) SearchItem(window, *state, ItemAtScreenPoint(state->tree, point));
         } else if (notice->code == TVN_KEYDOWN &&
                    reinterpret_cast<const NMTVKEYDOWN*>(lParam)->wVKey == VK_RETURN) {
             SearchItem(window, *state, TreeView_GetSelection(state->tree));
@@ -339,7 +381,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (reinterpret_cast<HWND>(wParam) != state->tree) break;
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const bool keyboard = point.x == -1 && point.y == -1;
-        const HTREEITEM item = keyboard ? TreeView_GetSelection(state->tree) : ItemAt(state->tree, point);
+        const HTREEITEM item = keyboard ? TreeView_GetSelection(state->tree) : ItemAtScreenPoint(state->tree, point);
         if (!item) return 0;
         TreeView_SelectItem(state->tree, item);
         if (keyboard) {

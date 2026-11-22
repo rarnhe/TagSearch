@@ -2,7 +2,7 @@ if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "TagSearch tests require Windows, MSVC and the Windows SDK")
 endif()
 
-# Compile the production layout directly, without the Win32 app entry point.
+# Compile the Caption layout and notification icon helpers without the app entry point.
 add_executable(tagsearch_tests test_tagsearch.cpp ../TagSearch_Caption.cpp TagSearch_Layout.h)
 target_link_libraries(tagsearch_tests PRIVATE TagSearchCore)
 target_compile_definitions(tagsearch_tests PRIVATE
@@ -27,6 +27,11 @@ set(cases
     search_condition_keeps_one_tag_literal
     search_condition_combines_all_tags_with_and
     create_search_folder_accepts_combined_tags
+    caption_reads_desktop_ini_icon_resource
+    caption_reads_legacy_desktop_ini_icon
+    caption_notice_matches_sender_icon_or_has_none
+    caption_selects_notice_icon_folders_by_arguments
+    caption_shortcut_stores_icon_and_app_id
     caption_layout_packs_variable_widths
     caption_layout_keeps_all_crowded_windows_and_counts_overlap
     caption_layout_randomizes_positions
@@ -47,6 +52,9 @@ add_test(NAME treeview_single_instance_startup
          COMMAND tagsearch_window_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
 add_test(NAME treeview_fixed_window_and_folder_title
          COMMAND tagsearch_window_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+add_test(NAME treeview_blank_click_preserves_selection
+         COMMAND tagsearch_window_startup_test treeview-blank-click $<TARGET_FILE:TagSearch_TreeView>
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 add_test(NAME caption_background_scan_and_native_tag_windows
          COMMAND tagsearch_window_startup_test caption $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
@@ -54,5 +62,6 @@ add_test(NAME caption_crowded_tags_are_all_visible
          COMMAND tagsearch_window_startup_test caption-crowded $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
+                     treeview_blank_click_preserves_selection
                      caption_background_scan_and_native_tag_windows caption_crowded_tags_are_all_visible
                      PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
