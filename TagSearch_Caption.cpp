@@ -643,7 +643,7 @@ std::unique_ptr<FloatingTag> CreateTag(Caption& caption, const std::wstring& tex
     return tag->window ? std::move(tag) : nullptr;
 }
 
-bool PositionTags(Caption& caption) {
+bool PositionTags(Caption& caption, bool firstShow = false) {
     const RECT work = PrimaryWorkArea();
     if (IsRectEmpty(&work)) return false;
     SetWindowPos(caption.controller, nullptr, work.left, work.top, 0, 0,
@@ -676,10 +676,12 @@ bool PositionTags(Caption& caption) {
     std::vector<RECT> bounds(widths.size());
     const LONG height = frame.bottom - frame.top;
     tagsearch::LayoutCaptionWindows(work, widths, height, bounds, caption.random);
+    // On first display, place and show each tag without requesting foreground activation.
+    const UINT flags = SWP_NOACTIVATE | (firstShow ? SWP_SHOWWINDOW | SWP_NOOWNERZORDER : SWP_NOZORDER);
     for (std::size_t i = 0; i < bounds.size(); ++i) {
         const auto& rect = bounds[i];
-        if (!SetWindowPos(caption.tags[i]->window, nullptr, rect.left, rect.top,
-                          rect.right - rect.left, rect.bottom - rect.top, SWP_NOACTIVATE | SWP_NOZORDER)) {
+        if (!SetWindowPos(caption.tags[i]->window, firstShow ? HWND_TOP : nullptr, rect.left, rect.top,
+                          rect.right - rect.left, rect.bottom - rect.top, flags)) {
             return false;
         }
     }
@@ -758,12 +760,9 @@ void ShowScanResult(Caption& caption) {
         caption.tags.push_back(std::move(tag));
     }
     caption.scan = {};
-    if (!caption.tags.empty()) {
-        if (!PositionTags(caption)) {
-            PostQuitMessage(1);
-            return;
-        }
-        ActivateTags(caption);
+    if (!caption.tags.empty() && !PositionTags(caption, true)) {
+        PostQuitMessage(1);
+        return;
     }
     UpdateOverlapNotice(caption, true);
     caption.exitAfterNotices = caption.tags.empty();

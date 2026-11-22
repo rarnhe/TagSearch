@@ -47,6 +47,9 @@ add_test(NAME treeview_single_instance_startup
          COMMAND tagsearch_window_startup_test startup $<TARGET_FILE:TagSearch_TreeView>)
 add_test(NAME treeview_fixed_window_and_folder_title
          COMMAND tagsearch_window_startup_test fixed-window $<TARGET_FILE:TagSearch_TreeView>)
+add_test(NAME treeview_blank_click_preserves_selection
+         COMMAND tagsearch_window_startup_test treeview-blank-click $<TARGET_FILE:TagSearch_TreeView>
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 add_test(NAME caption_background_scan_and_native_tag_windows
          COMMAND tagsearch_window_startup_test caption $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
@@ -54,5 +57,6 @@ add_test(NAME caption_crowded_tags_are_all_visible
          COMMAND tagsearch_window_startup_test caption-crowded $<TARGET_FILE:TagSearch_Caption>
                  "${CMAKE_CURRENT_SOURCE_DIR}/tagged.jpg")
 set_tests_properties(treeview_single_instance_startup treeview_fixed_window_and_folder_title
+                     treeview_blank_click_preserves_selection
                      caption_background_scan_and_native_tag_windows caption_crowded_tags_are_all_visible
                      PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
