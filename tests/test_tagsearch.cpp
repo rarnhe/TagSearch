@@ -15,6 +15,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <shellapi.h>
 #include <stdexcept>
@@ -23,6 +24,8 @@
 #include <vector>
 
 namespace tagsearch {
+HBITMAP CreateCaptionBitmap(HDC dc, SIZE size, const std::wstring& label,
+                            HFONT font, COLORREF color, LONG padding);
 std::span<const std::filesystem::path> CaptionNoticeIconFolders(
     std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments);
 HICON CreateCaptionNoticeTransportIcon();
@@ -540,6 +543,67 @@ void CaptionShortcutStoresIconAndAppId() {
            "an existing link to a different executable should be left untouched");
 }
 
+void CaptionBitmapPreservesBackgroundAndRevealsGlyphs() {
+    using MemoryDc = std::unique_ptr<std::remove_pointer_t<HDC>, decltype(&DeleteDC)>;
+    using Bitmap = std::unique_ptr<std::remove_pointer_t<HBITMAP>, decltype(&DeleteObject)>;
+    using Font = std::unique_ptr<std::remove_pointer_t<HFONT>, decltype(&DeleteObject)>;
+    const MemoryDc dc{CreateCompatibleDC(nullptr), &DeleteDC};
+    if (!dc) throw std::runtime_error("the caption bitmap needs a memory DC");
+
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    Expect(SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0,
+                                      USER_DEFAULT_SCREEN_DPI), "Windows should provide a caption font");
+    metrics.lfSmCaptionFont.lfQuality = ANTIALIASED_QUALITY;
+    metrics.lfSmCaptionFont.lfWeight = FW_NORMAL;
+    const Font normal{CreateFontIndirectW(&metrics.lfSmCaptionFont), &DeleteObject};
+    metrics.lfSmCaptionFont.lfWeight = FW_BOLD;
+    const Font bold{CreateFontIndirectW(&metrics.lfSmCaptionFont), &DeleteObject};
+    Expect(normal && bold, "the caption needs both font weights");
+
+    constexpr wchar_t label[] = L"alpha";
+    SIZE boldExtent{};
+    const auto previousFont = SelectObject(dc.get(), bold.get());
+    const BOOL measured = GetTextExtentPoint32W(dc.get(), label, 5, &boldExtent);
+    if (previousFont) SelectObject(dc.get(), previousFont);
+    Expect(measured && boldExtent.cx > 0, "the caption font should measure the label");
+    constexpr LONG padding = 4;
+    const SIZE size{boldExtent.cx + 2 * padding, boldExtent.cy + 8};
+
+    const auto inspect = [&](HFONT font, COLORREF color) {
+        const Bitmap bitmap{tagsearch::CreateCaptionBitmap(dc.get(), size, label, font, color, padding),
+                            &DeleteObject};
+        if (!bitmap) throw std::runtime_error("the renderer should create a caption bitmap");
+        DIBSECTION info{};
+        if (GetObjectW(bitmap.get(), sizeof(info), &info) != sizeof(info) || !info.dsBm.bmBits) {
+            throw std::runtime_error("the caption should contain readable BGRA pixels");
+        }
+        const std::span pixels(static_cast<const DWORD*>(info.dsBm.bmBits),
+                               static_cast<std::size_t>(size.cx) * size.cy);
+        const DWORD background = 0xff000000 | (GetRValue(color) << 16) | (GetGValue(color) << 8) | GetBValue(color);
+        Expect(pixels.front() == background, "the operator background should be opaque");
+        Expect(std::any_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 1; }),
+               "the center of a glyph should reveal the desktop");
+        Expect(std::none_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return (pixel >> 24) == 0; }),
+               "glyph pixels should remain hit-testable");
+        LONG left = size.cx;
+        LONG right = 0;
+        for (std::size_t i = 0; i < pixels.size(); ++i) {
+            if (pixels[i] == background) continue;
+            const LONG x = static_cast<LONG>(i % size.cx);
+            left = std::min(left, x);
+            right = std::max(right, x + 1);
+        }
+        Expect(left <= 8 && size.cx - right <= 8, "the caption should keep small side margins");
+        return std::count_if(pixels.begin(), pixels.end(), [=](DWORD pixel) { return pixel != background; });
+    };
+
+    constexpr COLORREF green = RGB(190, 235, 199);
+    Expect(inspect(bold.get(), green) > inspect(normal.get(), green),
+           "a bold title should expose more desktop pixels than a regular title");
+    inspect(bold.get(), RGB(248, 202, 219));
+    inspect(bold.get(), RGB(210, 212, 216));
+}
+
 void CaptionLayoutPacksVariableWidths() {
     const RECT work{-200, 30, 0, 80};
     const std::array<LONG, 6> widths{120, 120, 50, 50, 30, 30};
@@ -680,6 +744,7 @@ int main(int argc, char** argv) {
         {"caption_notice_matches_sender_icon_or_has_none", CaptionNoticeMatchesSenderIconOrHasNone},
         {"caption_selects_notice_icon_folders_by_arguments", CaptionSelectsNoticeIconFoldersByArguments},
         {"caption_shortcut_stores_icon_and_app_id", CaptionShortcutStoresIconAndAppId},
+        {"caption_bitmap_preserves_background_and_reveals_glyphs", CaptionBitmapPreservesBackgroundAndRevealsGlyphs},
         {"caption_layout_packs_variable_widths", CaptionLayoutPacksVariableWidths},
         {"caption_layout_keeps_all_crowded_windows_and_counts_overlap", CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap},
         {"caption_layout_randomizes_positions", CaptionLayoutRandomizesPositions},

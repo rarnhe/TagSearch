@@ -55,4 +55,4 @@ cmake --build out/test --config Release --parallel
 ctest --test-dir out/test -C Release --output-on-failure --no-tests=error
 ```
 
-直接生成工程时，两个 EXE 位于 `out/test/Release/`。Windows CI 验证上述 4 组预设的 EXE 架构并运行 CTest。测试覆盖标签规范化、默认目录、带引号的 Unicode 路径、嵌套 JPEG 的真实标签属性、首次构建缓存、再次读取及嵌套目录缓存、工作区内的随机布局、拥挤时的重叠计数、窗口重叠判断及 AND／OR／NOT 搜索对象创建。PR 的 `test_report.md` 与 JUnit 结果可从 Actions 下载，主分支运行后会更新仓库根目录的报告。集成测试会实际启动两个程序，检查 TreeView 的固定位置和目录标题、Caption 的后台扫描、标题配色与按下反馈、拥挤时同时显示全部标签，以及各自的单实例启动。Alt+Tab、Win+Tab、窗口拖动、跨屏 DPI、主题、系统通知及 Explorer 实际返回的结果适合在交互式 Windows 桌面验证。
+直接生成工程时，两个 EXE 位于 `out/test/Release/`。Windows CI 验证上述 4 组预设的 EXE 架构并运行 CTest。测试覆盖标签规范化、默认目录、带引号的 Unicode 路径、嵌套 JPEG 的真实标签属性、首次构建缓存、再次读取及嵌套目录缓存、工作区内的随机布局、拥挤时的重叠计数、窗口重叠判断及 AND／OR／NOT 搜索对象创建。PR 的 `test_report.md` 与 JUnit 结果可从 Actions 下载，主分支运行后会更新仓库根目录的报告。集成测试会实际启动两个程序，检查 TreeView 的固定位置和目录标题、Caption 的后台扫描和拥挤时同时显示全部标签，以及各自的单实例启动。位图测试检查 Caption 的标题配色、镂空与字重。Alt+Tab、Win+Tab、窗口拖动、跨屏 DPI、主题、系统通知及 Explorer 实际返回的结果适合在交互式 Windows 桌面验证。

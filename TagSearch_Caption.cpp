@@ -221,6 +221,52 @@ HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::
     return hr;
 }
 
+HBITMAP CreateCaptionBitmap(HDC dc, SIZE size, const std::wstring& label,
+                            HFONT font, COLORREF color, LONG padding) {
+    if (size.cx <= 0 || size.cy <= 0) return nullptr;
+
+    BITMAPINFO image{};
+    image.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    image.bmiHeader.biWidth = size.cx;
+    image.bmiHeader.biHeight = -size.cy;
+    image.bmiHeader.biPlanes = 1;
+    image.bmiHeader.biBitCount = 32;
+    image.bmiHeader.biCompression = BI_RGB;
+    void* data = nullptr;
+    const HBITMAP bitmap = CreateDIBSection(dc, &image, DIB_RGB_COLORS, &data, nullptr, 0);
+    if (!bitmap) return nullptr;
+    const auto previousBitmap = data ? SelectObject(dc, bitmap) : nullptr;
+    if (!previousBitmap) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+
+    // Rasterize the title into a grayscale mask. White glyph coverage removes
+    // the mode color, exposing whatever is behind the label.
+    PatBlt(dc, 0, 0, size.cx, size.cy, BLACKNESS);
+    const auto previousFont = font ? SelectObject(dc, font) : nullptr;
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RECT text{padding, 0, std::max(padding, size.cx - padding), size.cy};
+    DrawTextW(dc, label.c_str(), -1, &text,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    GdiFlush();
+
+    const auto count = static_cast<std::size_t>(size.cx) * size.cy;
+    for (auto& pixel : std::span(static_cast<DWORD*>(data), count)) {
+        // Zero-alpha pixels let mouse clicks pass through layered windows.
+        const DWORD alpha = std::max<DWORD>(1, 255 - (pixel & 0xff));
+        const DWORD red = (GetRValue(color) * alpha + 127) / 255;
+        const DWORD green = (GetGValue(color) * alpha + 127) / 255;
+        const DWORD blue = (GetBValue(color) * alpha + 127) / 255;
+        pixel = (alpha << 24) | (red << 16) | (green << 8) | blue;
+    }
+
+    if (previousFont) SelectObject(dc, previousFont);
+    SelectObject(dc, previousBitmap);
+    return bitmap;
+}
+
 } // namespace tagsearch
 
 #ifndef TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
@@ -413,52 +459,19 @@ HFONT CreateCaptionFont(UINT dpi, bool bold) {
     return CreateFontIndirectW(&metrics.lfSmCaptionFont);
 }
 
-bool PaintCaption(HWND window, const FloatingTag& tag, const RECT& bounds, HDC printTarget = nullptr) {
+bool PaintCaption(HWND window, const FloatingTag& tag, const RECT& bounds) {
     SIZE size{bounds.right - bounds.left, bounds.bottom - bounds.top};
-    if (size.cx <= 0 || size.cy <= 0) return false;
-
     using Bitmap = std::unique_ptr<std::remove_pointer_t<HBITMAP>, decltype(&DeleteObject)>;
     using MemoryDc = std::unique_ptr<std::remove_pointer_t<HDC>, decltype(&DeleteDC)>;
     Bitmap bitmap{nullptr, &DeleteObject};
     const MemoryDc dc{CreateCompatibleDC(nullptr), &DeleteDC};
     if (!dc) return false;
 
-    BITMAPINFO image{};
-    image.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    image.bmiHeader.biWidth = size.cx;
-    image.bmiHeader.biHeight = -size.cy;
-    image.bmiHeader.biPlanes = 1;
-    image.bmiHeader.biBitCount = 32;
-    image.bmiHeader.biCompression = BI_RGB;
-    void* data = nullptr;
-    bitmap.reset(CreateDIBSection(dc.get(), &image, DIB_RGB_COLORS, &data, nullptr, 0));
-    if (!bitmap || !data || !SelectObject(dc.get(), bitmap.get())) return false;
-
-    // Rasterize the title into a grayscale mask. White glyph coverage removes
-    // the mode color, exposing whatever is behind the label.
-    PatBlt(dc.get(), 0, 0, size.cx, size.cy, BLACKNESS);
     const auto& font = tag.pressed ? tag.caption.titleFont : tag.caption.boldTitleFont;
-    if (font) SelectObject(dc.get(), font.get());
-    SetBkMode(dc.get(), TRANSPARENT);
-    SetTextColor(dc.get(), RGB(255, 255, 255));
-    const LONG padding = Scale(kTitlePadding, WindowDpi(window));
-    RECT text{padding, 0, std::max(padding, size.cx - padding), size.cy};
-    DrawTextW(dc.get(), tag.text.c_str(), -1, &text,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-    GdiFlush();
-
     const COLORREF color = kTagModes[static_cast<std::size_t>(tag.operation)].color;
-    const auto count = static_cast<std::size_t>(size.cx) * size.cy;
-    for (auto& pixel : std::span(static_cast<DWORD*>(data), count)) {
-        // Zero-alpha pixels let mouse clicks pass through layered windows.
-        const DWORD alpha = std::max<DWORD>(1, 255 - (pixel & 0xff));
-        const DWORD red = (GetRValue(color) * alpha + 127) / 255;
-        const DWORD green = (GetGValue(color) * alpha + 127) / 255;
-        const DWORD blue = (GetBValue(color) * alpha + 127) / 255;
-        pixel = (alpha << 24) | (red << 16) | (green << 8) | blue;
-    }
-
-    if (printTarget) return BitBlt(printTarget, 0, 0, size.cx, size.cy, dc.get(), 0, 0, SRCCOPY) != FALSE;
+    bitmap.reset(tagsearch::CreateCaptionBitmap(dc.get(), size, tag.text, font.get(), color,
+                                               Scale(kTitlePadding, WindowDpi(window))));
+    if (!bitmap || !SelectObject(dc.get(), bitmap.get())) return false;
 
     POINT origin{bounds.left, bounds.top};
     POINT source{};
@@ -748,11 +761,6 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_NCHITTEST: {
         const auto hit = DefWindowProcW(window, message, wParam, lParam);
         return hit == HTCLIENT ? HTCAPTION : hit;
-    }
-    case WM_PRINTCLIENT: {
-        RECT bounds{};
-        return wParam && GetWindowRect(window, &bounds) &&
-            PaintCaption(window, *tag, bounds, reinterpret_cast<HDC>(wParam));
     }
     case WM_MOUSEACTIVATE:
         // Mouse activation can raise a lower window before the click is dispatched.

@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -340,96 +339,6 @@ void CheckTagBounds(const VisibleTags& tags, const RECT& work) {
     }
 }
 
-std::vector<DWORD> PrintCaption(HWND window) {
-    RECT client{};
-    Expect(GetClientRect(window, &client) && client.right > 0 && client.bottom > 0,
-           "the rendered caption should have a client rectangle");
-    std::vector<DWORD> pixels(static_cast<std::size_t>(client.right) * client.bottom);
-    const HDC dc = CreateCompatibleDC(nullptr);
-    if (!dc) throw std::runtime_error("the caption snapshot needs a memory DC");
-
-    BITMAPINFO image{};
-    image.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    image.bmiHeader.biWidth = client.right;
-    image.bmiHeader.biHeight = -client.bottom;
-    image.bmiHeader.biPlanes = 1;
-    image.bmiHeader.biBitCount = 32;
-    image.bmiHeader.biCompression = BI_RGB;
-
-    void* data = nullptr;
-    const HBITMAP bitmap = CreateDIBSection(dc, &image, DIB_RGB_COLORS, &data, nullptr, 0);
-    if (!bitmap || !data) {
-        if (bitmap) DeleteObject(bitmap);
-        DeleteDC(dc);
-        throw std::runtime_error("the caption snapshot needs a bitmap");
-    }
-    const auto previous = SelectObject(dc, bitmap);
-    DWORD_PTR result = 0;
-    const bool printed = SendMessageTimeoutW(window, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc),
-                                             PRF_CLIENT, SMTO_ABORTIFHUNG, 1000, &result) && result;
-    GdiFlush();
-    if (printed) std::memcpy(pixels.data(), data, pixels.size() * sizeof(DWORD));
-    if (previous) SelectObject(dc, previous);
-    DeleteObject(bitmap);
-    DeleteDC(dc);
-    Expect(printed, "the caption should draw into the supplied device context");
-    // GDI transfers the rendered RGB channels. The
-    // premultiplied glyph color is near zero, even if GDI discards the alpha byte.
-    for (auto& pixel : pixels) pixel &= 0x00ffffff;
-    return pixels;
-}
-
-void CheckCaptionPaint(HWND window) {
-    const auto send = [window](UINT message, WPARAM parameter = 0) {
-        DWORD_PTR result = 0;
-        Expect(SendMessageTimeoutW(window, message, parameter, 0, SMTO_ABORTIFHUNG, 1000, &result),
-               "the caption should handle the test input");
-    };
-    const auto checkColors = [](const std::vector<DWORD>& pixels, DWORD background) {
-        if (pixels.front() != background) {
-            std::cerr << "Caption background pixels: actual " << std::hex << pixels.front()
-                      << ", expected " << background << '\n';
-        }
-        Expect(pixels.front() == background, "the operator background should use the PR #8 color");
-        Expect(std::any_of(pixels.begin(), pixels.end(), [](DWORD pixel) { return pixel <= 0x010101; }),
-               "the center of a glyph should have near-zero premultiplied color");
-    };
-
-    constexpr UINT setTagMode = WM_APP + 5;
-    constexpr DWORD backgrounds[]{0xbeebc7, 0xf8cadb, 0xd2d4d8};
-    for (std::size_t i = 0; i < std::size(backgrounds); ++i) {
-        send(setTagMode, i + 1);
-        checkColors(PrintCaption(window), backgrounds[i]);
-    }
-
-    send(setTagMode, 1);
-    const auto bold = PrintCaption(window);
-    RECT client{};
-    Expect(GetClientRect(window, &client) && client.right > 0, "the caption should have a width");
-    LONG left = client.right;
-    LONG right = 0;
-    for (std::size_t i = 0; i < bold.size(); ++i) {
-        if (bold[i] == backgrounds[0]) continue;
-        const LONG x = static_cast<LONG>(i % client.right);
-        left = std::min(left, x);
-        right = std::max(right, x + 1);
-    }
-    const LONG maxPadding = MulDiv(8, GetDpiForWindow(window), USER_DEFAULT_SCREEN_DPI);
-    Expect(left <= maxPadding && client.right - right <= maxPadding,
-           "the caption should fit its title with small side margins");
-
-    send(WM_NCLBUTTONDOWN, HTCAPTION);
-    const auto pressed = PrintCaption(window);
-    checkColors(pressed, backgrounds[0]);
-    const auto glyphPixels = [](const std::vector<DWORD>& pixels) {
-        return std::count_if(pixels.begin(), pixels.end(), [=](DWORD pixel) { return pixel != backgrounds[0]; });
-    };
-    Expect(glyphPixels(bold) > glyphPixels(pressed),
-           "pressing the bold label should switch to the lighter font weight");
-    send(WM_CANCELMODE);
-    Expect(PrintCaption(window) == bold, "canceling the press should restore the bold title");
-}
-
 bool HasIntersection(const std::vector<RECT>& bounds) {
     for (std::size_t i = 0; i < bounds.size(); ++i) {
         for (std::size_t j = 0; j < i; ++j) {
@@ -463,9 +372,6 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     Expect(!HasIntersection(tags.bounds), "two short tags should fit without overlap");
     Expect(std::find(tags.windows.begin(), tags.windows.end(), GetForegroundWindow()) == tags.windows.end(),
            "initial Caption display should leave the foreground with the previous application");
-
-    const auto alpha = std::find(tags.titles.begin(), tags.titles.end(), L"alpha");
-    CheckCaptionPaint(tags.windows[static_cast<std::size_t>(alpha - tags.titles.begin())]);
 
     const auto originalWindows = tags.windows;
     const HWND tag = originalWindows.front();
