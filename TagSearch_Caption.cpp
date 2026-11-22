@@ -251,8 +251,6 @@ constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
 constexpr UINT kNoticeEvent = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
-constexpr UINT_PTR kClickFeedbackTimer = 1;
-constexpr UINT kClickFeedbackMs = 180;
 constexpr UINT kScanStarted = WM_APP + 6;
 constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
@@ -282,7 +280,6 @@ struct FloatingTag {
     bool pressed = false;
     bool dragging = false;
     bool moved = false;
-    bool clickFeedback = false;
     bool coloredCaption = false;
     POINT start{};
     POINT last{};
@@ -431,16 +428,26 @@ HFONT CreateCaptionFont(UINT dpi, bool bold) {
     return CreateFontIndirectW(&metrics.lfSmCaptionFont);
 }
 
-bool PaintBoldCaption(HWND window, const FloatingTag& tag) {
+void PaintBoldCaption(HWND window, const FloatingTag& tag) {
     RECT bounds{};
-    if (!GetWindowRect(window, &bounds)) return false;
+    RECT client{};
+    POINT origin{};
+    if (!GetWindowRect(window, &bounds) || !GetClientRect(window, &client) ||
+        !ClientToScreen(window, &origin)) return;
+
     const UINT dpi = WindowDpi(window);
+    const LONG left = origin.x - bounds.left;
+    const LONG bottom = origin.y - bounds.top;
+    const LONG height = GetSystemMetricsForDpi(SM_CYSMCAPTION, dpi);
+    const RECT caption{left, std::max(0L, bottom - height), left + client.right, bottom};
+    if (IsRectEmpty(&caption)) return;
+
     const HFONT font = CreateCaptionFont(dpi, true);
-    if (!font) return false;
+    if (!font) return;
     const HDC dc = GetWindowDC(window);
     if (!dc) {
         DeleteObject(font);
-        return false;
+        return;
     }
 
     const bool active = GetActiveWindow() == window;
@@ -448,12 +455,11 @@ bool PaintBoldCaption(HWND window, const FloatingTag& tag) {
         : GetSysColor(active ? COLOR_ACTIVECAPTION : COLOR_INACTIVECAPTION);
     const COLORREF text = GetSysColor(tag.coloredCaption ? COLOR_WINDOWTEXT
         : (active ? COLOR_CAPTIONTEXT : COLOR_INACTIVECAPTIONTEXT));
-    const RECT frame{0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top};
     SetDCBrushColor(dc, background);
-    FillRect(dc, &frame, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    FillRect(dc, &caption, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 
     const int padding = Scale(kTitlePadding, dpi);
-    RECT label{padding, 0, std::max<LONG>(padding, frame.right - padding), frame.bottom};
+    RECT label{caption.left + padding, caption.top, caption.right - padding, caption.bottom};
     const auto previousFont = SelectObject(dc, font);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, text);
@@ -462,22 +468,9 @@ bool PaintBoldCaption(HWND window, const FloatingTag& tag) {
     if (previousFont) SelectObject(dc, previousFont);
     ReleaseDC(window, dc);
     DeleteObject(font);
-    return true;
 }
 
-void ShowClickFeedback(HWND window, FloatingTag& tag) {
-    if (!SetTimer(window, kClickFeedbackTimer, kClickFeedbackMs, nullptr)) return;
-    if (tag.clickFeedback) return;
-
-    // The native title has no per-window font. Paint it while DWM's frame
-    // rendering (and its shadow) is temporarily disabled.
-    tag.clickFeedback = true;
-    constexpr DWMNCRENDERINGPOLICY policy = DWMNCRP_DISABLED;
-    if (FAILED(DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy)))) {
-        tag.clickFeedback = false;
-        KillTimer(window, kClickFeedbackTimer);
-        return;
-    }
+void RedrawCaption(HWND window) {
     RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
 }
 
@@ -747,7 +740,13 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     if (!tag) return DefWindowProcW(window, message, wParam, lParam);
 
     switch (message) {
-    case WM_CREATE:
+    case WM_CREATE: {
+        // Let the pressed label paint over the DWM caption while retaining its frame and shadow.
+        constexpr BOOL allowNonClientPaint = TRUE;
+        DwmSetWindowAttribute(window, DWMWA_ALLOW_NCPAINT, &allowNonClientPaint, sizeof(allowNonClientPaint));
+        ApplyTagColor(window, *tag);
+        break;
+    }
     case WM_SYSCOLORCHANGE:
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
@@ -764,12 +763,14 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         if (wParam != HTCAPTION) break;
         [[fallthrough]];
     case WM_LBUTTONDOWN:
-        if (GetCursorPos(&tag->start)) {
+        if (!tag->pressed && GetCursorPos(&tag->start)) {
             tag->last = tag->start;
-            tag->pressed = true;
             tag->dragging = false;
             tag->moved = false;
             SetCapture(window);
+            tag->pressed = GetCapture() == window;
+            if (tag->pressed) RedrawCaption(window);
+            else tag->clickTerms.clear();
         }
         return 0;
     case WM_MOUSEMOVE:
@@ -804,35 +805,25 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             auto terms = std::move(tag->clickTerms);
             tag->pressed = false;
             ReleaseCapture();
-            if (clicked) {
-                ShowClickFeedback(window, *tag);
-                ActivateTag(window, *tag, std::move(terms));
-            }
+            RedrawCaption(window);
+            if (clicked) ActivateTag(window, *tag, std::move(terms));
             if (moved) UpdateOverlapNotice(tag->caption);
             return 0;
         }
         break;
-    case WM_CAPTURECHANGED:
-        tag->pressed = false;
+    case WM_CAPTURECHANGED: {
+        const bool wasPressed = std::exchange(tag->pressed, false);
         tag->dragging = false;
         tag->moved = false;
         tag->clickTerms.clear();
+        if (wasPressed) RedrawCaption(window);
         return 0;
+    }
     case WM_NCPAINT:
-        if (tag->clickFeedback && PaintBoldCaption(window, *tag)) return 0;
-        break;
-    case WM_NCACTIVATE:
-        if (tag->clickFeedback) return TRUE;
-        break;
-    case WM_TIMER: {
-        if (wParam != kClickFeedbackTimer || !tag->clickFeedback) break;
-        KillTimer(window, kClickFeedbackTimer);
-        tag->clickFeedback = false;
-        constexpr DWMNCRENDERINGPOLICY policy = DWMNCRP_USEWINDOWSTYLE;
-        DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
-        ApplyTagColor(window, *tag);
-        RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
-        return 0;
+    case WM_NCACTIVATE: {
+        const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
+        if (tag->pressed) PaintBoldCaption(window, *tag);
+        return result;
     }
     case WM_KEYDOWN:
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
