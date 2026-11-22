@@ -261,9 +261,11 @@ HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::
     if (error) return E_FAIL;
     if (existing) {
         std::wstring target(32768, L'\0');
-        if (FAILED(file->Load(shortcut.c_str(), STGM_READ)) ||
-            FAILED(link->GetPath(target.data(), static_cast<int>(target.size()), nullptr, SLGP_RAWPATH)) ||
-            !std::filesystem::equivalent(target.c_str(), executable, error)) {
+        hr = file->Load(shortcut.c_str(), STGM_READWRITE);
+        if (FAILED(hr)) return hr;
+        hr = link->GetPath(target.data(), static_cast<int>(target.size()), nullptr, 0);
+        if (FAILED(hr)) return hr;
+        if (!std::filesystem::equivalent(target.c_str(), executable, error)) {
             return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
         }
     }

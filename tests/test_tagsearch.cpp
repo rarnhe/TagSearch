@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -393,8 +394,11 @@ void CaptionShortcutStoresIconAndAppId() {
     std::ofstream(executable).put('\0');
     Expect(SUCCEEDED(tagsearch::SaveCaptionShortcut(executable, shortcut, icon)),
            "the program should write a shortcut for its own executable");
-    Expect(SUCCEEDED(tagsearch::SaveCaptionShortcut(executable, shortcut, icon)),
-           "the program should be able to refresh its own shortcut");
+    const auto refreshed = tagsearch::SaveCaptionShortcut(executable, shortcut, icon);
+    if (FAILED(refreshed)) {
+        throw std::runtime_error("refreshing the program's own shortcut failed, HRESULT " +
+                                 std::to_string(static_cast<std::uint32_t>(refreshed)));
+    }
 
     Microsoft::WRL::ComPtr<IShellLinkW> link;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
