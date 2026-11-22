@@ -14,6 +14,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <memory>
 #include <optional>
 #include <shellapi.h>
 #include <stdexcept>
@@ -22,13 +24,14 @@
 #include <vector>
 
 namespace tagsearch {
-std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder);
+HBITMAP CreateCaptionBitmap(HDC dc, SIZE size, const std::wstring& label,
+                            HFONT font, COLORREF color, COLORREF accent, UINT dpi);
 std::span<const std::filesystem::path> CaptionNoticeIconFolders(
     std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments);
 HICON CreateCaptionNoticeTransportIcon();
 void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon, HICON transportIcon);
 HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::filesystem::path& shortcut,
-                             const std::pair<std::filesystem::path, int>& icon);
+                             const IconResource& icon);
 }
 
 namespace {
@@ -115,11 +118,13 @@ void ResolveFoldersKeepsKnownFolders() {
     }
 
     TestDirectory test;
-    const auto command = L"TagSearch.exe \"" + test.path.wstring() + L"\"";
-    const auto combined = tagsearch::ResolveSearchFolders(command.c_str());
-    Expect(combined.size() == defaultFolders.size() + 1 &&
+    auto command = L"TagSearch.exe \"" + test.path.wstring() + L"\"";
+    if (!defaultFolders.empty()) command += L" \"" + defaultFolders.front().wstring() + L"\"";
+    std::size_t defaultCount = 0;
+    const auto combined = tagsearch::ResolveSearchFolders(command.c_str(), &defaultCount);
+    Expect(defaultCount == defaultFolders.size() && combined.size() == defaultCount + 1 &&
                std::equal(defaultFolders.begin(), defaultFolders.end(), combined.begin()),
-           "additional folders should extend the known folders");
+           "explicitly repeating a default folder should keep it in the default prefix");
 }
 
 void ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs() {
@@ -164,6 +169,116 @@ void ScanTagsReadsNestedShellPropertiesWithoutUsingCache() {
         "a root must reach the JPEG through nested folders");
     fs::remove(image);
     Expect(tagsearch::ScanTags({test.path}).empty(), "a new scan should reflect a removed file");
+}
+
+std::wstring IniValue(const fs::path& ini, const wchar_t* section, const wchar_t* key) {
+    std::array<wchar_t, 512> text{};
+    GetPrivateProfileStringW(section, key, L"", text.data(), static_cast<DWORD>(text.size()), ini.c_str());
+    return text.data();
+}
+
+constexpr wchar_t summarySection[] = L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}";
+
+void CachesRequestedFoldersIndependently() {
+    TestDirectory test;
+    const auto first = test.path / L"Folder A";
+    const auto second = test.path / L"Folder B";
+    fs::create_directories(first / L"nested");
+    fs::create_directory(second);
+    fs::copy_file(fixturePath, first / L"nested" / L"tags.jpg");
+    fs::copy_file(fixturePath, first / L"duplicate.jpg");
+
+    const auto firstIni = first / L"desktop.ini";
+    const auto secondIni = second / L"desktop.ini";
+    std::ofstream(firstIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
+                              "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp2=31,Folder title\n"
+                              "[Other]\nProp5=31,unrelated\n";
+
+    const tagsearch::Folders folders{test.path, first, second};
+    const auto expected = tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"});
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), expected,
+                "a cold scan should merge deduplicated tags from requested directories");
+    const auto firstKeywords = IniValue(firstIni, summarySection, L"Prop5");
+    Expect(firstKeywords.starts_with(L"31,"), "the first directory should store a summary value");
+    ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(firstKeywords).substr(3))),
+                expected, "the first directory should store its own Unicode tag list");
+    {
+        std::ifstream ini(secondIni, std::ios::binary);
+        const std::string contents(std::istreambuf_iterator<char>{ini}, std::istreambuf_iterator<char>{});
+        const std::wstring expectedIni = L"\ufeff[.ShellClassInfo]\r\nInfoTip=\r\nIconResource=\r\n"
+            L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,\r\n";
+        ExpectEqual(contents, std::string(reinterpret_cast<const char*>(expectedIni.data()),
+                                         expectedIni.size() * sizeof(wchar_t)),
+                    "a new desktop.ini should use the shell template and store an empty tag list");
+    }
+    ExpectEqual(IniValue(firstIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
+                "writing the cache should preserve custom folder icons");
+    ExpectEqual(IniValue(firstIni, summarySection, L"Prop2"), std::wstring(L"31,Folder title"),
+                "writing the cache should preserve other summary values");
+    ExpectEqual(IniValue(firstIni, L"Other", L"Prop5"), std::wstring(L"31,unrelated"),
+                "only Prop5 in the summary section belongs to the cache");
+    Expect(!fs::exists(test.path / L"desktop.ini"), "implicit roots should not get a cache");
+
+    fs::remove_all(first / L"nested");
+    fs::remove(first / L"duplicate.jpg");
+    fs::copy_file(fixturePath, second / L"new.jpg");
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), expected,
+                "a warm run should reuse the stored snapshot after the original files are removed");
+
+    fs::remove(firstIni);
+    Expect(tagsearch::ScanTagsWithDesktopIniCache(folders, 1).empty(),
+           "an empty cache should skip newly added files even when an implicit root contains it");
+}
+
+void ScansDefaultRootsLiveAndRepairsInvalidCache() {
+    TestDirectory test;
+    const auto desktop = test.path / L"Desktop";
+    const auto downloads = test.path / L"Downloads";
+    const auto first = test.path / L"FolderA";
+    const auto second = test.path / L"FolderB";
+    for (const auto& folder : {desktop, downloads, first, second}) fs::create_directory(folder);
+
+    const auto desktopIni = desktop / L"desktop.ini";
+    const auto firstIni = first / L"desktop.ini";
+    const auto secondIni = second / L"desktop.ini";
+    std::ofstream(desktopIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=31,desktop value\n";
+    std::ofstream(firstIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=31,cached A;cached A\n";
+    std::ofstream(secondIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
+                               "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=19,invalid cache\n";
+    fs::copy_file(fixturePath, desktop / L"live.jpg");
+
+    // A live Shell read can expose a folder's own metadata, so compare against its actual live tags.
+    auto expected = tagsearch::ScanTags({desktop, downloads});
+    Expect(std::find(expected.begin(), expected.end(), L"alpha") != expected.end(),
+           "the default desktop fixture should provide a live file tag");
+    expected.push_back(L"cached A");
+    const tagsearch::Folders folders{desktop, downloads, first, second};
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 2), tagsearch::NormalizeTags(std::move(expected)),
+                "default live tags and explicit cached tags should be combined and deduplicated");
+    ExpectEqual(IniValue(desktopIni, summarySection, L"Prop5"), std::wstring(L"31,desktop value"),
+                "an existing default desktop.ini should be left alone");
+    Expect(!fs::exists(downloads / L"desktop.ini"), "a default folder without desktop.ini should stay that way");
+    ExpectEqual(IniValue(secondIni, summarySection, L"Prop5"), std::wstring(L"31,"),
+                "an invalid type should trigger a live scan and a new tag list in the existing file");
+    ExpectEqual(IniValue(secondIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
+                "repairing an invalid cache should preserve the custom icon");
+}
+
+void CombinesWarmAndColdNestedFolders() {
+    TestDirectory test;
+    const auto child = test.path / L"Child";
+    fs::create_directory(child);
+    const auto childIni = child / L"desktop.ini";
+    std::ofstream(childIni) << "[{f29f85e0-4ff9-1068-ab91-08002b27b3d9}]\n"
+                              "Prop5 = 31, cached ;cached; child\n";
+    fs::copy_file(fixturePath, child / L"live-only.jpg");
+    const auto expected = tagsearch::NormalizeTags({L"cached", L"child"});
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({test.path, child}, 0), expected,
+                "a cold parent should reuse a requested child's valid cache without rescanning the child");
+    const auto parentKeywords = IniValue(test.path / L"desktop.ini", summarySection, L"Prop5");
+    Expect(parentKeywords.starts_with(L"31,"), "the parent should store its own summary value");
+    ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(parentKeywords).substr(3))),
+                expected, "the parent snapshot should include the nested cached tags");
 }
 
 void CreateSearchFolderAcceptsMultipleScopesAndLiteralTag() {
@@ -302,7 +417,7 @@ std::size_t CountCaptionIntersections(std::span<const RECT> windows, const RECT&
     return count;
 }
 
-void CaptionReadsDesktopIniIconResource() {
+void ReadsDesktopIniIconResource() {
     TestDirectory test;
     {
         const std::wstring ini =
@@ -313,22 +428,22 @@ void CaptionReadsDesktopIniIconResource() {
         Expect(file.good(), "the fixture should write a Unicode desktop.ini");
     }
 
-    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    const auto icon = tagsearch::ReadDesktopIniIcon(test.path);
     ExpectEqual(icon, std::optional{std::pair{test.path / L"icons" / L"标记, light.ico", -7}},
                 "IconResource should retain a quoted relative path and signed index");
-    Expect(!tagsearch::ReadCaptionIconResource(test.path / L"missing"),
+    Expect(!tagsearch::ReadDesktopIniIcon(test.path / L"missing"),
            "a folder without desktop.ini should not supply an icon");
 }
 
-void CaptionReadsLegacyDesktopIniIcon() {
+void ReadsLegacyDesktopIniIcon() {
     TestDirectory test;
     {
         std::ofstream file(test.path / L"desktop.ini");
-        file << "[.ShellClassInfo]\nIconFile=%SystemRoot%\\System32\\shell32.dll\nIconIndex=0\n";
+        file << "[.shellclassinfo]\nIconResource=\"\"\nIconFile=%SystemRoot%\\System32\\shell32.dll\nIconIndex=\"0\"\n";
         Expect(file.good(), "the fixture should write an ANSI desktop.ini");
     }
 
-    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    const auto icon = tagsearch::ReadDesktopIniIcon(test.path);
     if (!icon) throw std::runtime_error("IconFile and IconIndex should supply a resource");
     Expect(icon->first.is_absolute() && icon->first.filename() == L"shell32.dll" && icon->second == 0,
            "the legacy icon should expand Windows environment variables and retain its index");
@@ -426,6 +541,85 @@ void CaptionShortcutStoresIconAndAppId() {
     Expect(matches, "the shortcut should retain Caption's AppUserModelID");
     Expect(FAILED(tagsearch::SaveCaptionShortcut(test.path / L"Different.exe", shortcut, icon)),
            "an existing link to a different executable should be left untouched");
+}
+
+void CaptionBitmapPreservesBackgroundAndRevealsGlyphs() {
+    using MemoryDc = std::unique_ptr<std::remove_pointer_t<HDC>, decltype(&DeleteDC)>;
+    using Bitmap = std::unique_ptr<std::remove_pointer_t<HBITMAP>, decltype(&DeleteObject)>;
+    using Font = std::unique_ptr<std::remove_pointer_t<HFONT>, decltype(&DeleteObject)>;
+    const MemoryDc dc{CreateCompatibleDC(nullptr), &DeleteDC};
+    if (!dc) throw std::runtime_error("the caption bitmap needs a memory DC");
+
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    Expect(SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0,
+                                      USER_DEFAULT_SCREEN_DPI), "Windows should provide a caption font");
+    metrics.lfSmCaptionFont.lfQuality = ANTIALIASED_QUALITY;
+    metrics.lfSmCaptionFont.lfWeight = FW_NORMAL;
+    const Font normal{CreateFontIndirectW(&metrics.lfSmCaptionFont), &DeleteObject};
+    metrics.lfSmCaptionFont.lfWeight = FW_BOLD;
+    const Font bold{CreateFontIndirectW(&metrics.lfSmCaptionFont), &DeleteObject};
+    Expect(normal && bold, "the caption needs both font weights");
+
+    constexpr wchar_t label[] = L"alpha";
+    SIZE boldExtent{};
+    const auto previousFont = SelectObject(dc.get(), bold.get());
+    const BOOL measured = GetTextExtentPoint32W(dc.get(), label, 5, &boldExtent);
+    if (previousFont) SelectObject(dc.get(), previousFont);
+    Expect(measured && boldExtent.cx > 0, "the caption font should measure the label");
+    constexpr LONG padding = 4;
+    const SIZE size{boldExtent.cx + 2 * padding, boldExtent.cy + 8};
+
+    constexpr COLORREF accent = RGB(35, 103, 201);
+    const auto render = [&](HFONT font, COLORREF color, const std::wstring& text) {
+        const Bitmap bitmap{tagsearch::CreateCaptionBitmap(dc.get(), size, text, font, color,
+                                                          accent, USER_DEFAULT_SCREEN_DPI), &DeleteObject};
+        if (!bitmap) throw std::runtime_error("the renderer should create a caption bitmap");
+        DIBSECTION info{};
+        if (GetObjectW(bitmap.get(), sizeof(info), &info) != sizeof(info) || !info.dsBm.bmBits) {
+            throw std::runtime_error("the caption should contain readable BGRA pixels");
+        }
+        const std::span pixels(static_cast<const DWORD*>(info.dsBm.bmBits),
+                               static_cast<std::size_t>(size.cx) * size.cy);
+        return std::vector<DWORD>(pixels.begin(), pixels.end());
+    };
+    const auto inspect = [&](HFONT font, COLORREF color) {
+        const auto frame = render(font, color, L"");
+        const auto pixels = render(font, color, label);
+        const auto width = static_cast<std::size_t>(size.cx);
+        const auto middle = width / 2;
+        constexpr DWORD edge = 0xff2367c9;
+        Expect(frame.front() == 0 && frame[width - 1] == 0 &&
+               frame[frame.size() - width] == 0 && frame.back() == 0,
+               "the four outside corners should be transparent");
+        Expect(frame[middle] == edge && frame[frame.size() - width + middle] == edge,
+               "the rounded outline should use the accent color");
+        const DWORD background = 0xff000000 | (GetRValue(color) << 16) | (GetGValue(color) << 8) | GetBValue(color);
+        Expect(frame[width + middle] == background, "the operator background should stay opaque inside the border");
+
+        LONG left = size.cx;
+        LONG right = 0;
+        std::size_t glyphCount = 0;
+        bool hasClearGlyph = false;
+        for (std::size_t i = 0; i < pixels.size(); ++i) {
+            if (pixels[i] == frame[i]) continue;
+            const DWORD alpha = pixels[i] >> 24;
+            Expect(alpha > 0, "glyph pixels should remain hit-testable");
+            hasClearGlyph |= alpha == 1;
+            ++glyphCount;
+            const LONG x = static_cast<LONG>(i % width);
+            left = std::min(left, x);
+            right = std::max(right, x + 1);
+        }
+        Expect(hasClearGlyph, "the center of a glyph should reveal the desktop");
+        Expect(left <= 8 && size.cx - right <= 8, "the caption should keep small side margins");
+        return glyphCount;
+    };
+
+    constexpr COLORREF green = RGB(190, 235, 199);
+    Expect(inspect(bold.get(), green) > inspect(normal.get(), green),
+           "a bold title should expose more desktop pixels than a regular title");
+    inspect(bold.get(), RGB(248, 202, 219));
+    inspect(bold.get(), RGB(210, 212, 216));
 }
 
 void CaptionLayoutPacksVariableWidths() {
@@ -553,6 +747,9 @@ int main(int argc, char** argv) {
         {"resolve_folders_keeps_known_folders", ResolveFoldersKeepsKnownFolders},
         {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
         {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
+        {"tag_cache_stores_requested_folders_independently", CachesRequestedFoldersIndependently},
+        {"tag_cache_scans_default_roots_live_and_repairs_invalid_cache", ScansDefaultRootsLiveAndRepairsInvalidCache},
+        {"tag_cache_combines_warm_and_cold_nested_folders", CombinesWarmAndColdNestedFolders},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
         {"overlap_finds_all_direct_intersections", OverlapFindsAllDirectIntersections},
@@ -560,11 +757,12 @@ int main(int argc, char** argv) {
         {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
         {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
-        {"caption_reads_desktop_ini_icon_resource", CaptionReadsDesktopIniIconResource},
-        {"caption_reads_legacy_desktop_ini_icon", CaptionReadsLegacyDesktopIniIcon},
+        {"desktop_ini_reads_icon_resource", ReadsDesktopIniIconResource},
+        {"desktop_ini_reads_legacy_icon", ReadsLegacyDesktopIniIcon},
         {"caption_notice_matches_sender_icon_or_has_none", CaptionNoticeMatchesSenderIconOrHasNone},
         {"caption_selects_notice_icon_folders_by_arguments", CaptionSelectsNoticeIconFoldersByArguments},
         {"caption_shortcut_stores_icon_and_app_id", CaptionShortcutStoresIconAndAppId},
+        {"caption_bitmap_preserves_background_and_reveals_glyphs", CaptionBitmapPreservesBackgroundAndRevealsGlyphs},
         {"caption_layout_packs_variable_widths", CaptionLayoutPacksVariableWidths},
         {"caption_layout_keeps_all_crowded_windows_and_counts_overlap", CaptionLayoutKeepsAllCrowdedWindowsAndCountsOverlap},
         {"caption_layout_randomizes_positions", CaptionLayoutRandomizesPositions},

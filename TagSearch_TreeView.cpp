@@ -1,6 +1,7 @@
 #include "TagSearch_Core.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <propkey.h>
 #include <propvarutil.h>
 #include <shlobj.h>
@@ -89,14 +90,8 @@ void RegisterAppShortcut() {
         return;
     }
 
-    const auto config = exe.parent_path() / L"desktop.ini";
-    std::array<wchar_t, MAX_PATH> icon{};
-    if (GetPrivateProfileStringW(L".ShellClassInfo", L"IconResource", L"",
-                                 icon.data(), static_cast<DWORD>(icon.size()), config.c_str())) {
-        const int index = PathParseIconLocationW(icon.data());
-        if (icon[0]) {
-            link->SetIconLocation(icon.data(), index);
-        }
+    if (const auto icon = ReadDesktopIniIcon(exe.parent_path())) {
+        link->SetIconLocation(icon->first.c_str(), icon->second);
     }
 
     ComPtr<IPropertyStore> properties;
@@ -265,7 +260,7 @@ void ScanOnStartup(HWND window, StartupScan& scan, std::promise<std::wstring>& t
             if (!stop.stop_requested()) {
                 title.set_value(FolderTitle(scan.folders, defaultCount));
                 PostMessageW(window, kFoldersResolved, 0, 0);
-                scan.tags = ScanTags(scan.folders, stop);
+                scan.tags = ScanTagsWithDesktopIniCache(scan.folders, defaultCount, stop);
                 scan.succeeded = !stop.stop_requested();
                 if (scan.succeeded) RegisterAppShortcut();
             }
@@ -275,6 +270,11 @@ void ScanOnStartup(HWND window, StartupScan& scan, std::promise<std::wstring>& t
         CoUninitialize();
     }
     if (!stop.stop_requested()) PostMessageW(window, kScanComplete, 0, 0);
+}
+
+void ApplyAccentBorder(HWND window) {
+    const COLORREF color = WindowAccentColor();
+    DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &color, sizeof(color));
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -295,7 +295,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (!state->tree || !SetWindowSubclass(state->tree, TreeMouseProc, 0, 0)) return -1;
         UpdateFont(window, *state);
         LayoutTree(window, *state);
-
+        ApplyAccentBorder(window);
         return 0;
     }
     case kFoldersResolved:
@@ -351,6 +351,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         break;
     case WM_SETTINGCHANGE:
         if (wParam == SPI_SETWORKAREA) UpdateDock(window, *state, GetDpiForWindow(window));
+        [[fallthrough]];
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+        ApplyAccentBorder(window);
         break;
     case WM_KEYDOWN:
         if (wParam == VK_TAB || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_HOME ||

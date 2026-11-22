@@ -237,6 +237,37 @@ void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
     ClosePanel(panel, process);
 }
 
+void CheckTreeCache(const fs::path& executable, const fs::path& fixture) {
+    const TestCopy copy(executable);
+    const auto image = copy.directory / L"tagged.jpg";
+    const auto ini = copy.directory / L"desktop.ini";
+    fs::copy_file(fixture, image);
+
+    const auto countTags = [&](const Process& process) {
+        const HWND panel = WaitForPanel(process);
+        WaitForTitle(panel, copy.directory.filename().wstring());
+        const HWND tree = FindWindowExW(panel, nullptr, WC_TREEVIEWW, nullptr);
+        if (!tree) throw std::runtime_error("the panel should contain a tree view");
+        const auto count = SendMessageW(tree, TVM_GETCOUNT, 0, 0);
+        ClosePanel(panel, process);
+        return count;
+    };
+
+    const Process cold(copy.executable, {copy.directory});
+    const auto count = countTags(cold);
+    Expect(count >= 2, "the cold TreeView launch should show the fixture tags");
+    std::array<wchar_t, 256> keywords{};
+    GetPrivateProfileStringW(L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}", L"Prop5", L"",
+                             keywords.data(), static_cast<DWORD>(keywords.size()), ini.c_str());
+    const std::wstring_view value(keywords.data());
+    Expect(value.starts_with(L"31,") && value.find(L"项目 & 资料") != std::wstring_view::npos,
+           "TreeView should write the requested directory's Unicode tag cache");
+
+    fs::remove(image);
+    const Process warm(copy.executable, {copy.directory});
+    Expect(countTags(warm) == count, "TreeView should recover the same rows from desktop.ini on next launch");
+}
+
 struct VisibleTags {
     HWND controller;
     bool unexpectedVisibleWindow = false;
@@ -279,22 +310,21 @@ void ReadVisibleCaptionTags(DWORD threadId, VisibleTags& tags) {
     EnumThreadWindows(threadId, RecordVisibleTags, reinterpret_cast<LPARAM>(&tags));
 }
 
-void CheckNativeCaption(HWND window, const RECT& bounds) {
+void CheckCaptionFrame(HWND window, const RECT& bounds) {
     const auto style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
     constexpr DWORD nativeStyle = WS_POPUP | WS_CAPTION;
     constexpr DWORD extraStyles = WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CHILD;
     Expect((style & (nativeStyle | extraStyles)) == nativeStyle,
            "a tag should use only the native popup caption style");
     const auto extended = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
-    Expect((extended & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) == WS_EX_TOOLWINDOW,
-           "a tag should be a native tool window without a layered surface");
+    constexpr DWORD popupStyle = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    Expect((extended & popupStyle) == popupStyle && !(extended & WS_EX_TRANSPARENT),
+           "a tag should have a layered tool window surface and remain clickable");
     RECT client{};
-    POINT clientOrigin{};
-    Expect(GetClientRect(window, &client) && client.bottom == client.top &&
-           ClientToScreen(window, &clientOrigin) && clientOrigin.y > bounds.top,
-           "the native title bar should be visible with zero client-area height");
-    const auto captionPoint = MAKELPARAM(bounds.left + (bounds.right - bounds.left) / 2,
-                                         bounds.top + (clientOrigin.y - bounds.top) / 2);
+    Expect(GetClientRect(window, &client) && client.right == bounds.right - bounds.left &&
+           client.bottom == bounds.bottom - bounds.top,
+           "the title should occupy the client area of the caption-only window");
+    const auto captionPoint = MAKELPARAM(bounds.left + client.right / 2, bounds.top + client.bottom / 2);
     DWORD_PTR hit = 0;
     Expect(SendMessageTimeoutW(window, WM_NCHITTEST, 0, captionPoint, SMTO_ABORTIFHUNG, 1000, &hit) &&
            hit == HTCAPTION, "Windows should hit-test the tag as a native title bar");
@@ -305,7 +335,7 @@ void CheckTagBounds(const VisibleTags& tags, const RECT& work) {
         const auto& rect = tags.bounds[i];
         Expect(!IsRectEmpty(&rect) && Within(rect, work),
                "the tag window must stay inside the primary work area");
-        CheckNativeCaption(tags.windows[i], rect);
+        CheckCaptionFrame(tags.windows[i], rect);
     }
 }
 
@@ -435,6 +465,8 @@ int wmain(int argc, wchar_t** argv) {
             CheckFixedWindowAndTitle(argv[2]);
         } else if (mode == L"treeview-blank-click" && argc == 4) {
             CheckTreeBlankClick(argv[2], argv[3]);
+        } else if (mode == L"treeview-cache" && argc == 4) {
+            CheckTreeCache(argv[2], argv[3]);
         } else if (mode == L"caption" && argc == 4) {
             CheckCaptionLayout(argv[2], argv[3]);
         } else if (mode == L"caption-crowded" && argc == 4) {
