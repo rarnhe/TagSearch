@@ -30,6 +30,8 @@ set(cases
     caption_reads_desktop_ini_icon_resource
     caption_reads_legacy_desktop_ini_icon
     caption_notice_matches_sender_icon_or_has_none
+    caption_selects_notice_icon_folders_by_arguments
+    caption_shortcut_stores_icon_and_app_id
     caption_layout_packs_variable_widths
     caption_layout_keeps_all_crowded_windows_and_counts_overlap
     caption_layout_randomizes_positions

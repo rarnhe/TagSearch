@@ -1,8 +1,13 @@
 #include "TagSearch_Core.h"
 
+#include <propkey.h>
+#include <propvarutil.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwchar>
 #include <limits>
@@ -208,17 +213,76 @@ std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(con
     return std::pair{(folder / expanded).lexically_normal(), index};
 }
 
-void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon) {
-    notice.hIcon = icon;
+std::span<const std::filesystem::path> CaptionNoticeIconFolders(
+    std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments) {
+    return hasFolderArguments ? folders.subspan(defaultCount) : folders.first(defaultCount);
+}
+
+HICON CreateCaptionNoticeTransportIcon() {
+    constexpr int size = 16;
+    using Mask = std::array<BYTE, size * size / 8>;
+    Mask andMask{};
+    andMask.fill(0xff);
+    const Mask xorMask{};
+    return CreateIcon(GetModuleHandleW(nullptr), size, size, 1, 1, andMask.data(), xorMask.data());
+}
+
+void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon, HICON transportIcon) {
+    // Explorer needs a tray entry to send the balloon, even for NIIF_NONE.
+    notice.hIcon = icon ? icon : transportIcon;
     notice.hBalloonIcon = icon;
     notice.dwInfoFlags = icon ? NIIF_USER : NIIF_NONE;
-    if (icon) notice.uFlags |= NIF_ICON;
+    if (notice.hIcon) notice.uFlags |= NIF_ICON;
     else notice.uFlags &= ~NIF_ICON;
 
-    // Use the same resource for the sender window and the notification, including the empty state.
     const auto iconHandle = reinterpret_cast<LPARAM>(icon);
     SendMessageW(notice.hWnd, WM_SETICON, ICON_SMALL, iconHandle);
     SendMessageW(notice.hWnd, WM_SETICON, ICON_BIG, iconHandle);
+}
+
+namespace {
+constexpr wchar_t kCaptionAppId[] = L"TagSearch.Caption";
+}
+
+HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::filesystem::path& shortcut,
+                             const std::pair<std::filesystem::path, int>& icon) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IShellLinkW> link;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(link.GetAddressOf()));
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IPersistFile> file;
+    hr = link.As(&file);
+    if (FAILED(hr)) return hr;
+
+    std::error_code error;
+    const bool existing = std::filesystem::exists(shortcut, error);
+    if (error) return E_FAIL;
+    if (existing) {
+        std::wstring target(32768, L'\0');
+        if (FAILED(file->Load(shortcut.c_str(), STGM_READ)) ||
+            FAILED(link->GetPath(target.data(), static_cast<int>(target.size()), nullptr, SLGP_RAWPATH)) ||
+            !std::filesystem::equivalent(target.c_str(), executable, error)) {
+            return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+        }
+    }
+
+    hr = link->SetPath(executable.c_str());
+    if (SUCCEEDED(hr)) hr = link->SetWorkingDirectory(executable.parent_path().c_str());
+    if (SUCCEEDED(hr)) hr = link->SetIconLocation(icon.first.c_str(), icon.second);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IPropertyStore> properties;
+    hr = link.As(&properties);
+    if (FAILED(hr)) return hr;
+    PROPVARIANT appId{};
+    hr = InitPropVariantFromString(kCaptionAppId, &appId);
+    if (SUCCEEDED(hr)) hr = properties->SetValue(PKEY_AppUserModel_ID, appId);
+    PropVariantClear(&appId);
+    if (SUCCEEDED(hr)) hr = properties->Commit();
+    if (SUCCEEDED(hr)) hr = file->Save(shortcut.c_str(), TRUE);
+    return hr;
 }
 
 } // namespace tagsearch
@@ -299,6 +363,34 @@ struct ScanNoticeData {
     NoticeIcons icons;
 };
 
+OwnedIcon ExtractCaptionIcon(const IconResource& resource) {
+    HICON icon = nullptr;
+    ExtractIconExW(resource.first.c_str(), resource.second, nullptr, &icon, 1);
+    return OwnedIcon(icon, &DestroyIcon);
+}
+
+void RegisterCaptionShortcut() {
+    std::wstring executableName(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, executableName.data(), static_cast<DWORD>(executableName.size()));
+    if (!length || length >= executableName.size()) return;
+    executableName.resize(length);
+    const std::filesystem::path executable(executableName);
+    const auto resource = tagsearch::ReadCaptionIconResource(executable.parent_path());
+    if (!resource || !ExtractCaptionIcon(*resource)) return;
+
+    PWSTR programs = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs);
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> programsPath(programs, &CoTaskMemFree);
+    if (FAILED(result) || !programsPath) return;
+
+    auto shortcut = std::filesystem::path(programsPath.get()) / executable.filename();
+    shortcut.replace_extension(L".lnk");
+    if (SUCCEEDED(tagsearch::SaveCaptionShortcut(executable, shortcut, *resource))) {
+        SetCurrentProcessExplicitAppUserModelID(tagsearch::kCaptionAppId);
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, shortcut.c_str(), nullptr);
+    }
+}
+
 NoticeIcons LoadNoticeIcons(std::span<const std::filesystem::path> folders, std::stop_token stop) {
     NoticeIcons icons;
     for (const auto& folder : folders) {
@@ -306,9 +398,8 @@ NoticeIcons LoadNoticeIcons(std::span<const std::filesystem::path> folders, std:
         auto resource = tagsearch::ReadCaptionIconResource(folder);
         if (!resource || icons.contains(*resource)) continue;
 
-        HICON icon = nullptr;
-        ExtractIconExW(resource->first.c_str(), resource->second, nullptr, &icon, 1);
-        if (icon) icons.emplace(std::move(*resource), OwnedIcon(icon, &DestroyIcon));
+        auto icon = ExtractCaptionIcon(*resource);
+        if (icon) icons.emplace(std::move(*resource), std::move(icon));
     }
     return icons;
 }
@@ -325,6 +416,7 @@ struct Caption {
     bool exitAfterNotices = false;
     ScanResult scan;
     NoticeIcons noticeIcons;
+    OwnedIcon noticeTransportIcon{tagsearch::CreateCaptionNoticeTransportIcon(), &DestroyIcon};
     std::future<ScanNoticeData> scanNotice;
     std::jthread scanner;
 
@@ -522,7 +614,7 @@ void ShowNotice(Caption& caption, UINT& icon, const std::wstring& title, std::ws
         const auto offset = std::uniform_int_distribution<std::size_t>(0, caption.noticeIcons.size() - 1)(caption.random);
         iconForNotice = std::next(caption.noticeIcons.begin(), static_cast<std::ptrdiff_t>(offset))->second.get();
     }
-    tagsearch::ConfigureCaptionNoticeIcon(notice, iconForNotice);
+    tagsearch::ConfigureCaptionNoticeIcon(notice, iconForNotice, caption.noticeTransportIcon.get());
     if (!Shell_NotifyIconW(NIM_ADD, &notice)) return;
 
     icon = notice.uID;
@@ -552,7 +644,7 @@ void UpdateOverlapNotice(Caption& caption, bool initialLayout = false) {
     ShowNotice(caption, caption.overlapIcon, title, std::move(body));
 }
 
-tagsearch::Folders ScanNoticeFolders(const wchar_t* commandLine, std::span<const std::filesystem::path> defaults) {
+tagsearch::Folders ScanNoticeArguments(const wchar_t* commandLine) {
     int count = 0;
     const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
         CommandLineToArgvW(commandLine, &count), &LocalFree);
@@ -568,7 +660,6 @@ tagsearch::Folders ScanNoticeFolders(const wchar_t* commandLine, std::span<const
         if (!folder.has_filename() && folder.has_relative_path()) folder = folder.parent_path();
         folders.push_back(std::move(folder));
     }
-    if (folders.empty()) folders.assign(defaults.begin(), defaults.end());
     return folders;
 }
 
@@ -822,8 +913,11 @@ void ScanInBackground(Caption& caption, std::promise<ScanNoticeData>& notice, st
             scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount);
             if (!stop.stop_requested()) {
                 const std::span<const std::filesystem::path> folders = scan.folders;
-                notice.set_value({ScanNoticeFolders(commandLine, folders.first(defaultCount)),
-                                  LoadNoticeIcons(folders.subspan(defaultCount), stop)});
+                auto displayFolders = ScanNoticeArguments(commandLine);
+                const bool hasFolderArguments = !displayFolders.empty();
+                const auto iconFolders = tagsearch::CaptionNoticeIconFolders(folders, defaultCount, hasFolderArguments);
+                if (!hasFolderArguments) displayFolders.assign(iconFolders.begin(), iconFolders.end());
+                notice.set_value({std::move(displayFolders), LoadNoticeIcons(iconFolders, stop)});
                 PostMessageW(caption.controller, kScanStarted, 0, 0);
                 scan.tags = tagsearch::ScanTags(scan.folders, stop);
                 scan.success = !stop.stop_requested();
@@ -989,6 +1083,7 @@ int RunSingleInstance(HINSTANCE instance) {
 
     int result = 1;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        RegisterCaptionShortcut();
         result = Run(instance);
         CoUninitialize();
     }
