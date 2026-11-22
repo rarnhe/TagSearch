@@ -1,12 +1,12 @@
 # TagSearch C++ Windows 测试报告
 
 - 状态：通过 (Passed)
-- 时间（UTC）：2026-11-21 15:42:40
-- 测试源码基准提交：95db0868711bed3530772448b70c1b6e849135cf
-- 执行记录：https://github.com/rarnhe/TagSearch/actions/runs/44920552460
+- 时间（UTC）：2026-11-22 05:33:41
+- 测试源码基准提交：f006c5d091978a5584aeef7a78e4b056432b75c4
+- 执行记录：https://github.com/rarnhe/TagSearch/actions/runs/44989858304
 - 平台：Windows / MSVC / C++20 / Windows SDK
 - 阶段：Configure=success / Build=success / CTest=success
-- 统计：通过 23 / 失败 0 / 跳过 0 / 共 23
+- 统计：通过 29 / 失败 0 / 跳过 0 / 共 29
 
 ## GitHub Actions 阶段状态
 
@@ -35,12 +35,18 @@
 | search_condition_keeps_one_tag_literal | 通过 |
 | search_condition_combines_all_tags_with_and | 通过 |
 | create_search_folder_accepts_combined_tags | 通过 |
+| caption_reads_desktop_ini_icon_resource | 通过 |
+| caption_reads_legacy_desktop_ini_icon | 通过 |
+| caption_notice_matches_sender_icon_or_has_none | 通过 |
+| caption_selects_notice_icon_folders_by_arguments | 通过 |
+| caption_shortcut_stores_icon_and_app_id | 通过 |
 | caption_layout_packs_variable_widths | 通过 |
 | caption_layout_keeps_all_crowded_windows_and_counts_overlap | 通过 |
 | caption_layout_randomizes_positions | 通过 |
 | mixed_tag_query_matches_windows_search_order | 通过 |
 | treeview_single_instance_startup | 通过 |
 | treeview_fixed_window_and_folder_title | 通过 |
+| treeview_blank_click_preserves_selection | 通过 |
 | caption_background_scan_and_native_tag_windows | 通过 |
 | caption_crowded_tags_are_all_visible | 通过 |
 
