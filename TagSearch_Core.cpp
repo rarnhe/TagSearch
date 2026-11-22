@@ -199,10 +199,13 @@ std::optional<DesktopIni> ReadDesktopIni(const fs::path& path) {
         file.peek() != std::char_traits<char>::eof() || file.bad()) return std::nullopt;
 
     std::wstring text;
-    if (bytes.starts_with("\xff\xfe") || bytes.starts_with("\xfe\xff")) {
+    const unsigned int marker = bytes.size() >= 2
+        ? (static_cast<unsigned char>(bytes[0]) << 8) | static_cast<unsigned char>(bytes[1])
+        : 0;
+    if (marker == 0xfffe || marker == 0xfeff) {
         if ((bytes.size() - 2) % sizeof(wchar_t)) return std::nullopt;
         text.resize((bytes.size() - 2) / sizeof(wchar_t));
-        if (bytes.starts_with("\xff\xfe")) {
+        if (marker == 0xfffe) {
             std::memcpy(text.data(), bytes.data() + 2, bytes.size() - 2);
         } else {
             for (std::size_t i = 0; i < text.size(); ++i) {
