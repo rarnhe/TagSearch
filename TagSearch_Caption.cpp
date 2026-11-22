@@ -1,8 +1,4 @@
-#ifdef TAGSEARCH_CAPTION_LAYOUT_TEST_ONLY
-#include "tests/TagSearch_Layout.h"
-#else
 #include "TagSearch_Core.h"
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -150,11 +146,13 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
 #include <shellapi.h>
 #include <windowsx.h>
 #include <cwchar>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 // Each executable supplies this externally linked entry point for the CRT.
@@ -172,8 +170,10 @@ constexpr wchar_t kMutexName[] = L"Local\\TagSearch.Caption.AEF63BC1-F7FC-4837-B
 constexpr UINT kActivate = WM_APP + 1;
 constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
-constexpr UINT kOverlapNotice = WM_APP + 4;
+constexpr UINT kNoticeEvent = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
+constexpr UINT kScanStarted = WM_APP + 6;
+constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
 constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW;
 using tagsearch::TagOperator;
@@ -217,22 +217,39 @@ struct Caption {
     std::vector<std::unique_ptr<FloatingTag>> tags;
     std::mt19937 random{std::random_device{}()};
     tagsearch::Folders folders;
+    UINT scanIcon = 0;
     UINT overlapIcon = 0;
-    UINT lastOverlapIcon = 0;
+    UINT lastNoticeIcon = 0;
+    bool exitAfterNotices = false;
     ScanResult scan;
+    std::future<std::wstring> scanFolderNames;
     std::jthread scanner;
 
-    void DismissOverlapNotice() {
-        if (!overlapIcon) return;
+    void DismissNotice(UINT& icon) {
+        if (!icon) return;
         NOTIFYICONDATAW notice{sizeof(notice)};
         notice.hWnd = controller;
-        notice.uID = std::exchange(overlapIcon, 0);
+        notice.uID = std::exchange(icon, 0);
         Shell_NotifyIconW(NIM_DELETE, &notice);
         KillTimer(controller, notice.uID);
     }
 
+    void QuitIfNoNotices() const {
+        if (exitAfterNotices && !scanIcon && !overlapIcon) PostQuitMessage(0);
+    }
+
+    bool FinishNotice(UINT icon) {
+        if (!icon) return false;
+        if (icon == scanIcon) DismissNotice(scanIcon);
+        else if (icon == overlapIcon) DismissNotice(overlapIcon);
+        else return false;
+        QuitIfNoNotices();
+        return true;
+    }
+
     ~Caption() {
-        DismissOverlapNotice();
+        DismissNotice(scanIcon);
+        DismissNotice(overlapIcon);
         if (controller) DestroyWindow(controller);
     }
 };
@@ -369,35 +386,78 @@ std::wstring OverlapNoticeBody(HWND window, std::span<const tagsearch::TagWindow
     return message;
 }
 
-void UpdateOverlapNotice(Caption& caption) {
-    const auto windows = VisibleTagsInZOrder(caption);
-    const auto groups = OverlapGroups(windows);
-    caption.DismissOverlapNotice();
-    if (groups.empty()) return;
+void ShowNotice(Caption& caption, UINT& icon, const std::wstring& title, std::wstring body) {
+    caption.DismissNotice(icon);
+    if (body.size() > kNoticeBodyLimit) {
+        body.resize(kNoticeBodyLimit - 3);
+        if (body.back() >= 0xd800 && body.back() <= 0xdbff) body.pop_back();
+        body += L"...";
+    }
 
     NOTIFYICONDATAW notice{sizeof(notice)};
     notice.hWnd = caption.controller;
-    // A queued callback from an older balloon must not dismiss this one.
-    caption.lastOverlapIcon = caption.lastOverlapIcon % 0xffff + 1;
-    notice.uID = caption.lastOverlapIcon;
+    // A queued callback from an older balloon must not dismiss a newer one.
+    caption.lastNoticeIcon = caption.lastNoticeIcon % 0xffff + 1;
+    notice.uID = caption.lastNoticeIcon;
     notice.uFlags = NIF_ICON | NIF_MESSAGE;
-    notice.uCallbackMessage = kOverlapNotice;
+    notice.uCallbackMessage = kNoticeEvent;
     notice.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     if (!Shell_NotifyIconW(NIM_ADD, &notice)) return;
 
-    caption.overlapIcon = notice.uID;
+    icon = notice.uID;
     notice.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &notice);
     notice.uFlags = NIF_INFO;
     notice.dwInfoFlags = NIIF_INFO;
-    const auto title = L"重叠标签组 「" + std::to_wstring(groups.size()) + L"」";
     wcscpy_s(notice.szInfoTitle, title.c_str());
-    const auto message = OverlapNoticeBody(caption.controller, windows, groups, std::size(notice.szInfo) - 1);
-    wcscpy_s(notice.szInfo, message.c_str());
+    wcscpy_s(notice.szInfo, body.c_str());
     if (!Shell_NotifyIconW(NIM_MODIFY, &notice) ||
         !SetTimer(caption.controller, notice.uID, 60000, nullptr)) {
-        caption.DismissOverlapNotice();
+        caption.DismissNotice(icon);
     }
+}
+
+void UpdateOverlapNotice(Caption& caption, bool initialLayout = false) {
+    const auto windows = VisibleTagsInZOrder(caption);
+    const auto groups = OverlapGroups(windows);
+    if (groups.empty() && !initialLayout) {
+        caption.DismissNotice(caption.overlapIcon);
+        return;
+    }
+
+    const auto title = L"重叠标签组 「" + std::to_wstring(groups.size()) + L"」";
+    auto body = groups.empty()
+        ? L"统计标记数量 「" + std::to_wstring(caption.tags.size()) + L"」"
+        : OverlapNoticeBody(caption.controller, windows, groups, kNoticeBodyLimit);
+    ShowNotice(caption, caption.overlapIcon, title, std::move(body));
+}
+
+void AppendFolderName(std::wstring& names, std::filesystem::path folder) {
+    folder = folder.lexically_normal();
+    if (folder.filename() == L"." || folder.filename() == L"..") {
+        std::error_code error;
+        const auto absolute = std::filesystem::absolute(folder, error);
+        if (!error) folder = absolute.lexically_normal();
+    }
+    if (!folder.has_filename() && folder.has_relative_path()) folder = folder.parent_path();
+
+    if (!names.empty()) names += L'·';
+    const auto name = folder.filename();
+    names += (name.empty() ? folder : name).wstring();
+}
+
+std::wstring ScanFolderNames(const wchar_t* commandLine, std::span<const std::filesystem::path> defaults) {
+    int count = 0;
+    const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
+        CommandLineToArgvW(commandLine, &count), &LocalFree);
+    std::wstring names;
+    for (int i = 1; arguments && i < count; ++i) {
+        if (arguments.get()[i][0] != L'\0') AppendFolderName(names, arguments.get()[i]);
+    }
+    if (!names.empty()) return names;
+
+    for (const auto& folder : defaults) AppendFolderName(names, folder);
+    return names.empty() ? L"Desktop·Downloads" : names;
 }
 
 bool PastDragThreshold(HWND window, const FloatingTag& tag, POINT point) {
@@ -620,13 +680,19 @@ void ActivateTags(Caption& caption) {
     if (!windows.empty()) SetForegroundWindow(windows.front());
 }
 
-void ScanInBackground(Caption& caption, std::stop_token stop) {
+void ScanInBackground(Caption& caption, std::promise<std::wstring>& folderNames, std::stop_token stop) {
     auto& scan = caption.scan;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
         try {
-            scan.folders = tagsearch::ResolveSearchFolders(GetCommandLineW());
-            scan.tags = tagsearch::ScanTags(scan.folders, stop);
-            scan.success = !stop.stop_requested();
+            const auto commandLine = GetCommandLineW();
+            std::size_t defaultCount = 0;
+            scan.folders = tagsearch::ResolveSearchFolders(commandLine, &defaultCount);
+            if (!stop.stop_requested()) {
+                folderNames.set_value(ScanFolderNames(commandLine, std::span(scan.folders).first(defaultCount)));
+                PostMessageW(caption.controller, kScanStarted, 0, 0);
+                scan.tags = tagsearch::ScanTags(scan.folders, stop);
+                scan.success = !stop.stop_requested();
+            }
         } catch (...) {
             scan.success = false;
         }
@@ -638,8 +704,10 @@ void ScanInBackground(Caption& caption, std::stop_token stop) {
 
 bool StartStartupScan(Caption& caption) {
     try {
-        caption.scanner = std::jthread([&caption](std::stop_token stop) {
-            ScanInBackground(caption, stop);
+        std::promise<std::wstring> folderNames;
+        caption.scanFolderNames = folderNames.get_future();
+        caption.scanner = std::jthread([&caption, folderNames = std::move(folderNames)](std::stop_token stop) mutable {
+            ScanInBackground(caption, folderNames, stop);
         });
     } catch (const std::system_error&) {
         return false;
@@ -666,16 +734,16 @@ void ShowScanResult(Caption& caption) {
         caption.tags.push_back(std::move(tag));
     }
     caption.scan = {};
-    if (caption.tags.empty()) {
-        PostQuitMessage(0);
-        return;
+    if (!caption.tags.empty()) {
+        if (!PositionTags(caption)) {
+            PostQuitMessage(1);
+            return;
+        }
+        ActivateTags(caption);
     }
-    if (!PositionTags(caption)) {
-        PostQuitMessage(1);
-        return;
-    }
-    ActivateTags(caption);
-    UpdateOverlapNotice(caption);
+    UpdateOverlapNotice(caption, true);
+    caption.exitAfterNotices = caption.tags.empty();
+    caption.QuitIfNoNotices();
 }
 
 LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -687,6 +755,11 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     if (!caption) return DefWindowProcW(window, message, wParam, lParam);
 
     switch (message) {
+    case kScanStarted:
+        if (caption->scanFolderNames.valid()) {
+            ShowNotice(*caption, caption->scanIcon, L"正在读取标签…", caption->scanFolderNames.get());
+        }
+        return 0;
     case kScanComplete:
         ShowScanResult(*caption);
         return 0;
@@ -703,17 +776,15 @@ LRESULT CALLBACK ControllerProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case kReflow:
         if (!caption->tags.empty()) PositionTags(*caption);
         return 0;
-    case kOverlapNotice:
-        if (HIWORD(lParam) == caption->overlapIcon &&
-            (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT ||
-             LOWORD(lParam) == NIN_BALLOONUSERCLICK)) {
-            caption->DismissOverlapNotice();
+    case kNoticeEvent:
+        if (LOWORD(lParam) == NIN_BALLOONHIDE || LOWORD(lParam) == NIN_BALLOONTIMEOUT ||
+            LOWORD(lParam) == NIN_BALLOONUSERCLICK) {
+            caption->FinishNotice(HIWORD(lParam));
         }
         return 0;
     case WM_TIMER:
-        if (wParam != caption->overlapIcon) break;
-        caption->DismissOverlapNotice();
-        return 0;
+        if (caption->FinishNotice(static_cast<UINT>(wParam))) return 0;
+        break;
     case WM_CLOSE:
         PostQuitMessage(0);
         return 0;
