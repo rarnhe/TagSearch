@@ -166,6 +166,76 @@ void ScanTagsReadsNestedShellPropertiesWithoutUsingCache() {
     Expect(tagsearch::ScanTags({test.path}).empty(), "a new scan should reflect a removed file");
 }
 
+std::wstring IniValue(const fs::path& ini, const wchar_t* section, const wchar_t* key) {
+    std::array<wchar_t, 512> text{};
+    GetPrivateProfileStringW(section, key, L"", text.data(), static_cast<DWORD>(text.size()), ini.c_str());
+    return text.data();
+}
+
+constexpr wchar_t summarySection[] = L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}";
+
+void CaptionCachesRequestedFoldersIndependently() {
+    TestDirectory test;
+    const auto first = test.path / L"Folder A";
+    const auto second = test.path / L"Folder B";
+    fs::create_directories(first / L"nested");
+    fs::create_directory(second);
+    fs::copy_file(fixturePath, first / L"nested" / L"tags.jpg");
+    fs::copy_file(fixturePath, first / L"duplicate.jpg");
+
+    const auto firstIni = first / L"desktop.ini";
+    const auto secondIni = second / L"desktop.ini";
+    std::ofstream(firstIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
+                              "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp2=31,Folder title\n"
+                              "[Other]\nProp5=31,unrelated\n";
+
+    const tagsearch::Folders requested{first, second};
+    const tagsearch::Folders folders{test.path, first, second};
+    const auto expected = tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"});
+    ExpectEqual(tagsearch::ScanCaptionTags(folders, requested), expected,
+                "a cold scan should merge deduplicated tags from requested directories");
+    const auto firstKeywords = IniValue(firstIni, summarySection, L"Prop5");
+    Expect(firstKeywords.starts_with(L"31,"), "the first directory should store a summary value");
+    ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(firstKeywords).substr(3))),
+                expected, "the first directory should store its own Unicode tag list");
+    ExpectEqual(IniValue(secondIni, summarySection, L"Prop5"), std::wstring(L"31,"),
+                "a directory without tags should store an empty cache");
+    ExpectEqual(IniValue(firstIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
+                "writing the cache should preserve custom folder icons");
+    ExpectEqual(IniValue(firstIni, summarySection, L"Prop2"), std::wstring(L"31,Folder title"),
+                "writing the cache should preserve other summary values");
+    ExpectEqual(IniValue(firstIni, L"Other", L"Prop5"), std::wstring(L"31,unrelated"),
+                "only Prop5 in the summary section belongs to the cache");
+    Expect(!fs::exists(test.path / L"desktop.ini"), "implicit roots should not get a cache");
+
+    fs::remove_all(first / L"nested");
+    fs::remove(first / L"duplicate.jpg");
+    fs::copy_file(fixturePath, second / L"new.jpg");
+    ExpectEqual(tagsearch::ScanCaptionTags(folders, requested), expected,
+                "a warm run should reuse the stored snapshot after the original files are removed");
+
+    fs::remove(firstIni);
+    Expect(tagsearch::ScanCaptionTags(folders, requested).empty(),
+           "an empty cache should skip newly added files even when an implicit root contains it");
+}
+
+void CaptionCombinesWarmAndColdNestedFolders() {
+    TestDirectory test;
+    const auto child = test.path / L"Child";
+    fs::create_directory(child);
+    const auto childIni = child / L"desktop.ini";
+    std::ofstream(childIni) << "[{f29f85e0-4ff9-1068-ab91-08002b27b3d9}]\n"
+                              "Prop5 = 31, cached ;cached; child\n";
+    fs::copy_file(fixturePath, child / L"live-only.jpg");
+    const auto expected = tagsearch::NormalizeTags({L"cached", L"child"});
+    ExpectEqual(tagsearch::ScanCaptionTags({test.path, child}, {test.path, child}), expected,
+                "a cold parent should reuse a requested child's valid cache without rescanning the child");
+    const auto parentKeywords = IniValue(test.path / L"desktop.ini", summarySection, L"Prop5");
+    Expect(parentKeywords.starts_with(L"31,"), "the parent should store its own summary value");
+    ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(parentKeywords).substr(3))),
+                expected, "the parent snapshot should include the nested cached tags");
+}
+
 void CreateSearchFolderAcceptsMultipleScopesAndLiteralTag() {
     TestDirectory test;
     const auto first = test.path / L"one & 本地";
@@ -553,6 +623,8 @@ int main(int argc, char** argv) {
         {"resolve_folders_keeps_known_folders", ResolveFoldersKeepsKnownFolders},
         {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
         {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
+        {"caption_caches_requested_folders_independently", CaptionCachesRequestedFoldersIndependently},
+        {"caption_combines_warm_and_cold_nested_folders", CaptionCombinesWarmAndColdNestedFolders},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
         {"overlap_finds_all_direct_intersections", OverlapFindsAllDirectIntersections},

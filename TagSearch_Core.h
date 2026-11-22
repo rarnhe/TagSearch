@@ -41,10 +41,12 @@ std::vector<TagSearchTerm> TermsForOverlappingWindows(
 std::wstring FormatTagQuery(std::span<const TagSearchTerm> terms);
 
 // Pass a complete Unicode command line, including argv[0].
-Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount = nullptr);
+Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount = nullptr,
+                             Folders* requestedFolders = nullptr);
 
 // Call Shell operations from a thread with COM initialized.
 Tags ScanTags(const Folders& folders, std::stop_token stop = {});
+Tags ScanCaptionTags(const Folders& folders, const Folders& requestedFolders, std::stop_token stop = {});
 HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result);
 HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result);
 HRESULT CreateTagQueryCondition(std::span<const TagSearchTerm> terms, ICondition** result);

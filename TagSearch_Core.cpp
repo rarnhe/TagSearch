@@ -8,10 +8,16 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
+#include <climits>
+#include <cstring>
 #include <cwctype>
+#include <fstream>
 #include <iterator>
 #include <locale>
+#include <map>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <set>
 #include <utility>
@@ -27,15 +33,17 @@ using TaskMemory = std::unique_ptr<T, decltype(&CoTaskMemFree)>;
 
 using Pidl = TaskMemory<std::remove_pointer_t<PIDLIST_ABSOLUTE>>;
 
-void AddFolder(Folders& folders, const fs::path& candidate) {
-    if (candidate.empty()) {
-        return;
-    }
+void AddFolder(Folders& folders, const fs::path& candidate, Folders* requested = nullptr) {
+    if (candidate.empty()) return;
 
     std::error_code error;
     auto folder = fs::canonical(candidate, error);
-    if (!error && fs::is_directory(folder, error) &&
-        std::find(folders.begin(), folders.end(), folder) == folders.end()) {
+    if (error || !fs::is_directory(folder, error)) return;
+
+    if (requested && std::find(requested->begin(), requested->end(), folder) == requested->end()) {
+        requested->push_back(folder);
+    }
+    if (std::find(folders.begin(), folders.end(), folder) == folders.end()) {
         folders.push_back(std::move(folder));
     }
 }
@@ -143,22 +151,200 @@ std::vector<std::wstring> NormalizeTags(std::vector<std::wstring> tags) {
     return normalized;
 }
 
-Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount) {
+Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount, Folders* requestedFolders) {
     Folders folders;
     AddKnownFolder(folders, FOLDERID_Desktop);
     AddKnownFolder(folders, FOLDERID_Downloads);
     if (defaultCount) *defaultCount = folders.size();
+    if (requestedFolders) requestedFolders->clear();
 
     int count = 0;
     const std::unique_ptr<LPWSTR, decltype(&LocalFree)> arguments(
         CommandLineToArgvW(commandLine, &count), &LocalFree);
     for (int i = 1; arguments && i < count; ++i) {
-        AddFolder(folders, arguments.get()[i]);
+        AddFolder(folders, arguments.get()[i], requestedFolders);
     }
     return folders;
 }
 
-Tags ScanTags(const Folders& folders, std::stop_token stop) {
+namespace {
+
+struct FolderSnapshot {
+    Tags tags;
+    bool complete;
+};
+
+using FolderSnapshots = std::map<fs::path, FolderSnapshot>;
+
+struct DesktopIni {
+    bool exists;
+    std::wstring text;
+};
+
+std::optional<DesktopIni> ReadDesktopIni(const fs::path& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND) return DesktopIni{false, {}};
+        return std::nullopt;
+    }
+    if (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return std::nullopt;
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return std::nullopt;
+    const auto size = static_cast<std::streamoff>(file.tellg());
+    if (size < 0 || size > INT_MAX) return std::nullopt;
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    file.seekg(0);
+    if (!file.read(bytes.data(), static_cast<std::streamsize>(size)) ||
+        file.peek() != std::char_traits<char>::eof() || file.bad()) return std::nullopt;
+
+    std::wstring text;
+    if (bytes.starts_with("\xff\xfe") || bytes.starts_with("\xfe\xff")) {
+        if ((bytes.size() - 2) % sizeof(wchar_t)) return std::nullopt;
+        text.resize((bytes.size() - 2) / sizeof(wchar_t));
+        if (bytes.starts_with("\xff\xfe")) {
+            std::memcpy(text.data(), bytes.data() + 2, bytes.size() - 2);
+        } else {
+            for (std::size_t i = 0; i < text.size(); ++i) {
+                const auto high = static_cast<unsigned char>(bytes[2 + i * 2]);
+                const auto low = static_cast<unsigned char>(bytes[3 + i * 2]);
+                text[i] = static_cast<wchar_t>((high << 8) | low);
+            }
+        }
+    } else if (!bytes.empty()) {
+        const bool utf8 = bytes.starts_with("\xef\xbb\xbf");
+        const int offset = utf8 ? 3 : 0;
+        const int length = static_cast<int>(bytes.size()) - offset;
+        if (length) {
+            const UINT codePage = utf8 ? CP_UTF8 : CP_ACP;
+            const DWORD flags = utf8 ? MB_ERR_INVALID_CHARS : 0;
+            const int required = MultiByteToWideChar(codePage, flags, bytes.data() + offset, length, nullptr, 0);
+            if (!required) return std::nullopt;
+            text.resize(required);
+            if (!MultiByteToWideChar(codePage, flags, bytes.data() + offset, length, text.data(), required)) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (text.find(L'\0') != std::wstring::npos) return std::nullopt;
+    return DesktopIni{true, std::move(text)};
+}
+
+constexpr std::wstring_view kSummarySection = L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]";
+
+bool EqualsIniName(std::wstring_view value, std::wstring_view name) {
+    return value.size() == name.size() &&
+        CompareStringOrdinal(value.data(), static_cast<int>(value.size()),
+                             name.data(), static_cast<int>(name.size()), TRUE) == CSTR_EQUAL;
+}
+
+struct KeywordLocation {
+    std::size_t position = std::wstring_view::npos;
+    std::size_t length = 0;
+    std::wstring_view value;
+};
+
+KeywordLocation FindDesktopIniKeywords(std::wstring_view text) {
+    bool inSummary = false;
+    for (std::size_t start = 0; start < text.size();) {
+        auto end = text.find_first_of(L"\r\n", start);
+        if (end == std::wstring_view::npos) end = text.size();
+        const auto line = TrimWhitespace(text.substr(start, end - start));
+
+        if (!line.empty() && line.front() == L'[' && line.back() == L']') {
+            if (inSummary) return {start};
+            inSummary = EqualsIniName(line, kSummarySection);
+        } else if (inSummary) {
+            const auto rawLine = text.substr(start, end - start);
+            const auto separator = rawLine.find(L'=');
+            if (separator != std::wstring_view::npos &&
+                EqualsIniName(TrimWhitespace(rawLine.substr(0, separator)), L"Prop5")) {
+                return {start, end - start, rawLine.substr(separator + 1)};
+            }
+        }
+
+        start = end + 1;
+        if (end < text.size() && text[end] == L'\r' && start < text.size() && text[start] == L'\n') ++start;
+    }
+    return {inSummary ? text.size() : std::wstring_view::npos};
+}
+
+std::optional<Tags> ReadCachedTags(const DesktopIni& ini, const KeywordLocation& entry) {
+    const auto value = TrimWhitespace(entry.value);
+    if (!ini.exists || !value.starts_with(L"31,")) return std::nullopt;
+    return NormalizeTags(SplitKeywords(std::wstring_view(value).substr(3)));
+}
+
+void SaveCachedTags(const fs::path& path, const DesktopIni& original, const KeywordLocation& entry,
+                    const Tags& tags, std::stop_token stop) {
+    // The Windows Prop5 list has no escape syntax for semicolons or line breaks.
+    constexpr std::wstring_view unsupported(L";\r\n\0", 4);
+    constexpr std::wstring_view prefix = L"Prop5=31,";
+    std::wstring line(prefix);
+    for (const auto& tag : tags) {
+        if (tag.find_first_of(unsupported) != std::wstring::npos) return;
+        if (line.size() > prefix.size()) line += L';';
+        line += tag;
+    }
+
+    auto text = original.text;
+    auto position = entry.position;
+    if (position == std::wstring_view::npos) {
+        if (!text.empty() && text.back() != L'\n' && text.back() != L'\r') text += L"\r\n";
+        text += kSummarySection;
+        text += L"\r\n";
+        position = text.size();
+    }
+    if (entry.length) {
+        text.replace(position, entry.length, line);
+    } else {
+        if (position && text[position - 1] != L'\n' && text[position - 1] != L'\r') line.insert(0, L"\r\n");
+        text.insert(position, line + L"\r\n");
+    }
+    text.insert(text.begin(), L'\ufeff');
+    if (text.size() > MAXDWORD / sizeof(wchar_t) || stop.stop_requested()) return;
+
+    GUID id{};
+    std::array<wchar_t, 39> token{};
+    if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id, token.data(), static_cast<int>(token.size()))) return;
+    const auto temp = path.parent_path() / (std::wstring(L".TagSearch-") + token.data() + L".tmp");
+    const HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    const auto length = static_cast<DWORD>(text.size() * sizeof(wchar_t));
+    DWORD written = 0;
+    const bool ready = WriteFile(file, text.data(), length, &written, nullptr) &&
+        written == length && FlushFileBuffers(file);
+    CloseHandle(file);
+
+    // If another program edited desktop.ini during the scan, leave that version in place.
+    if (ready && !stop.stop_requested()) {
+        const auto current = ReadDesktopIni(path);
+        if (current && current->exists == original.exists && current->text == original.text) {
+            if (original.exists) {
+                const DWORD attributes = GetFileAttributesW(path.c_str());
+                constexpr DWORD preserved = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+                if (attributes != INVALID_FILE_ATTRIBUTES &&
+                    (!(attributes & preserved) || SetFileAttributesW(temp.c_str(), attributes & preserved))) {
+                    auto backup = temp;
+                    backup += L".bak";
+                    if (ReplaceFileW(path.c_str(), temp.c_str(), backup.c_str(), 0, nullptr, nullptr)) {
+                        DeleteFileW(backup.c_str());
+                    } else if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                               GetLastError() == ERROR_FILE_NOT_FOUND) {
+                        MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+                    }
+                }
+            } else {
+                MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+            }
+        }
+    }
+    DeleteFileW(temp.c_str());
+}
+
+Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapshots,
+                           std::stop_token stop, bool* complete = nullptr) {
     Tags tags;
     Folders pending = folders;
     std::set<fs::path> visited;
@@ -169,13 +355,21 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
             continue;
         }
 
+        if (const auto cached = snapshots.find(folder); cached != snapshots.end()) {
+            tags.insert(tags.end(), cached->second.tags.begin(), cached->second.tags.end());
+            if (complete && !cached->second.complete) *complete = false;
+            continue;
+        }
+
         ReadItemTags(folder, tags);
         std::error_code error;
-        for (fs::directory_iterator entry(folder, fs::directory_options::skip_permission_denied, error), end;
+        const auto options = complete ? fs::directory_options::none : fs::directory_options::skip_permission_denied;
+        for (fs::directory_iterator entry(folder, options, error), end;
              !error && entry != end && !stop.stop_requested(); entry.increment(error)) {
             const auto& path = entry->path();
             const DWORD attributes = GetFileAttributesW(path.c_str());
             if (attributes == INVALID_FILE_ATTRIBUTES) {
+                if (complete) *complete = false;
                 continue;
             }
             if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
@@ -199,8 +393,44 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
             }
             pending.push_back(path);
         }
+        if (complete && error) *complete = false;
     }
     return stop.stop_requested() ? Tags{} : NormalizeTags(std::move(tags));
+}
+
+} // namespace
+
+Tags ScanTags(const Folders& folders, std::stop_token stop) {
+    return ScanTagsWithSnapshots(folders, {}, stop);
+}
+
+Tags ScanCaptionTags(const Folders& folders, const Folders& requestedFolders, std::stop_token stop) {
+    auto ordered = requestedFolders;
+    // Resolve children first so a parent scan can reuse any explicitly requested child snapshot.
+    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
+        return left.native().size() > right.native().size();
+    });
+
+    FolderSnapshots snapshots;
+    for (const auto& folder : ordered) {
+        if (stop.stop_requested()) return {};
+        const auto path = folder / L"desktop.ini";
+        const auto original = ReadDesktopIni(path);
+        if (original) {
+            const auto entry = FindDesktopIniKeywords(original->text);
+            if (auto cached = ReadCachedTags(*original, entry)) {
+                snapshots.emplace(folder, FolderSnapshot{std::move(*cached), true});
+                continue;
+            }
+        }
+        bool complete = true;
+        auto tags = ScanTagsWithSnapshots({folder}, snapshots, stop, &complete);
+        if (original && complete && !stop.stop_requested()) {
+            SaveCachedTags(path, *original, FindDesktopIniKeywords(original->text), tags, stop);
+        }
+        snapshots.emplace(folder, FolderSnapshot{std::move(tags), complete});
+    }
+    return ScanTagsWithSnapshots(folders, snapshots, stop);
 }
 
 std::vector<TagSearchTerm> TermsForOverlappingWindows(
