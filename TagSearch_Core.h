@@ -5,10 +5,12 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 struct ICondition;
@@ -17,6 +19,7 @@ namespace tagsearch {
 
 using Folders = std::vector<std::filesystem::path>;
 using Tags = std::vector<std::wstring>;
+using IconResource = std::pair<std::filesystem::path, int>;
 
 Tags SplitKeywords(std::wstring_view value);
 Tags NormalizeTags(Tags tags);
@@ -47,6 +50,7 @@ Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCou
 Tags ScanTags(const Folders& folders, std::stop_token stop = {});
 // The first defaultCount roots are scanned live; remaining roots may use desktop.ini snapshots.
 Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop = {});
+std::optional<IconResource> ReadDesktopIniIcon(const std::filesystem::path& folder);
 HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result);
 HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result);
 HRESULT CreateTagQueryCondition(std::span<const TagSearchTerm> terms, ICondition** result);

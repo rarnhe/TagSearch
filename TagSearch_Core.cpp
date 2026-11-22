@@ -11,6 +11,7 @@
 #include <array>
 #include <climits>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <fstream>
 #include <iterator>
@@ -96,8 +97,8 @@ std::wstring TrimWhitespace(std::wstring_view value) {
 
 } // namespace
 
-std::vector<std::wstring> SplitKeywords(std::wstring_view value) {
-    std::vector<std::wstring> tags;
+Tags SplitKeywords(std::wstring_view value) {
+    Tags tags;
     std::size_t start = 0;
 
     while (start <= value.size()) {
@@ -119,7 +120,7 @@ std::vector<std::wstring> SplitKeywords(std::wstring_view value) {
     return tags;
 }
 
-std::vector<std::wstring> NormalizeTags(std::vector<std::wstring> tags) {
+Tags NormalizeTags(Tags tags) {
     std::set<std::wstring> distinct;
     for (const auto& tag : tags) {
         std::wstring trimmed = TrimWhitespace(tag);
@@ -128,7 +129,7 @@ std::vector<std::wstring> NormalizeTags(std::vector<std::wstring> tags) {
         }
     }
 
-    std::vector<std::wstring> normalized(distinct.begin(), distinct.end());
+    Tags normalized(distinct.begin(), distinct.end());
 
     try {
         const std::locale userLocale("");
@@ -230,6 +231,8 @@ std::optional<DesktopIni> ReadDesktopIni(const fs::path& path) {
     return DesktopIni{true, std::move(text)};
 }
 
+constexpr wchar_t kDesktopIniName[] = L"desktop.ini";
+constexpr std::wstring_view kShellClassInfo = L"[.ShellClassInfo]";
 constexpr std::wstring_view kSummarySection = L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]";
 
 bool EqualsIniName(std::wstring_view value, std::wstring_view name) {
@@ -238,27 +241,27 @@ bool EqualsIniName(std::wstring_view value, std::wstring_view name) {
                              name.data(), static_cast<int>(name.size()), TRUE) == CSTR_EQUAL;
 }
 
-struct KeywordLocation {
+struct IniEntry {
     std::size_t position = std::wstring_view::npos;
     std::size_t length = 0;
     std::wstring_view value;
 };
 
-KeywordLocation FindDesktopIniKeywords(std::wstring_view text) {
-    bool inSummary = false;
+IniEntry FindIniEntry(std::wstring_view text, std::wstring_view section, std::wstring_view key) {
+    bool inSection = false;
     for (std::size_t start = 0; start < text.size();) {
         auto end = text.find_first_of(L"\r\n", start);
         if (end == std::wstring_view::npos) end = text.size();
         const auto line = TrimWhitespace(text.substr(start, end - start));
 
         if (!line.empty() && line.front() == L'[' && line.back() == L']') {
-            if (inSummary) return {start};
-            inSummary = EqualsIniName(line, kSummarySection);
-        } else if (inSummary) {
+            if (inSection) return {start};
+            inSection = EqualsIniName(line, section);
+        } else if (inSection) {
             const auto rawLine = text.substr(start, end - start);
             const auto separator = rawLine.find(L'=');
             if (separator != std::wstring_view::npos &&
-                EqualsIniName(TrimWhitespace(rawLine.substr(0, separator)), L"Prop5")) {
+                EqualsIniName(TrimWhitespace(rawLine.substr(0, separator)), key)) {
                 return {start, end - start, rawLine.substr(separator + 1)};
             }
         }
@@ -266,16 +269,33 @@ KeywordLocation FindDesktopIniKeywords(std::wstring_view text) {
         start = end + 1;
         if (end < text.size() && text[end] == L'\r' && start < text.size() && text[start] == L'\n') ++start;
     }
-    return {inSummary ? text.size() : std::wstring_view::npos};
+    return {inSection ? text.size() : std::wstring_view::npos};
 }
 
-std::optional<Tags> ReadCachedTags(const DesktopIni& ini, const KeywordLocation& entry) {
+std::wstring_view UnquoteIniValue(std::wstring_view value) {
+    if (value.size() >= 2 && value.front() == value.back() &&
+        (value.front() == L'"' || value.front() == L'\'')) {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+std::optional<int> ParseIconIndex(std::wstring_view text) {
+    const auto trimmed = TrimWhitespace(text);
+    const std::wstring value(UnquoteIniValue(trimmed));
+    wchar_t* end = nullptr;
+    const auto index = std::wcstoll(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end || index < INT_MIN || index > INT_MAX) return std::nullopt;
+    return static_cast<int>(index);
+}
+
+std::optional<Tags> ReadCachedTags(const DesktopIni& ini, const IniEntry& entry) {
     const auto value = TrimWhitespace(entry.value);
     if (!ini.exists || !value.starts_with(L"31,")) return std::nullopt;
     return NormalizeTags(SplitKeywords(std::wstring_view(value).substr(3)));
 }
 
-void SaveCachedTags(const fs::path& path, const DesktopIni& original, const KeywordLocation& entry,
+void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniEntry& entry,
                     const Tags& tags, std::stop_token stop) {
     // The Windows Prop5 list has no escape syntax for semicolons or line breaks.
     constexpr std::wstring_view unsupported(L";\r\n\0", 4);
@@ -288,7 +308,10 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const Keyw
     }
 
     auto text = original.text;
-    if (text.empty()) text = L"[.ShellClassInfo]\r\nInfoTip=\r\nIconResource=\r\n";
+    if (text.empty()) {
+        text = kShellClassInfo;
+        text += L"\r\nInfoTip=\r\nIconResource=\r\n";
+    }
     auto position = entry.position;
     if (position == std::wstring_view::npos) {
         if (!text.empty() && text.back() != L'\n' && text.back() != L'\r') text += L"\r\n";
@@ -401,6 +424,34 @@ Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapsh
 
 } // namespace
 
+std::optional<IconResource> ReadDesktopIniIcon(const fs::path& folder) {
+    const auto ini = ReadDesktopIni(folder / kDesktopIniName);
+    if (!ini || !ini->exists) return std::nullopt;
+
+    auto value = TrimWhitespace(FindIniEntry(ini->text, kShellClassInfo, L"IconResource").value);
+    int index = 0;
+    if (UnquoteIniValue(value).empty()) {
+        value = TrimWhitespace(FindIniEntry(ini->text, kShellClassInfo, L"IconFile").value);
+        index = ParseIconIndex(FindIniEntry(ini->text, kShellClassInfo, L"IconIndex").value).value_or(0);
+    } else if (const auto comma = value.rfind(L','); comma != std::wstring::npos) {
+        if (const auto parsed = ParseIconIndex(std::wstring_view(value).substr(comma + 1))) {
+            index = *parsed;
+            value = TrimWhitespace(std::wstring_view(value).substr(0, comma));
+        }
+    }
+    const std::wstring input(UnquoteIniValue(value));
+    if (input.empty()) return std::nullopt;
+
+    const DWORD capacity = ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
+    if (!capacity || capacity > 32768) return std::nullopt;
+    std::wstring expanded(capacity, L'\0');
+    const DWORD length = ExpandEnvironmentStringsW(input.c_str(), expanded.data(), capacity);
+    if (!length || length > capacity) return std::nullopt;
+    expanded.resize(length - 1);
+
+    return IconResource{(folder / expanded).lexically_normal(), index};
+}
+
 Tags ScanTags(const Folders& folders, std::stop_token stop) {
     return ScanTagsWithSnapshots(folders, {}, stop);
 }
@@ -416,10 +467,11 @@ Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCoun
     FolderSnapshots snapshots;
     for (const auto& folder : ordered) {
         if (stop.stop_requested()) return {};
-        const auto path = folder / L"desktop.ini";
+        const auto path = folder / kDesktopIniName;
         const auto original = ReadDesktopIni(path);
+        IniEntry entry;
         if (original) {
-            const auto entry = FindDesktopIniKeywords(original->text);
+            entry = FindIniEntry(original->text, kSummarySection, L"Prop5");
             if (auto cached = ReadCachedTags(*original, entry)) {
                 snapshots.emplace(folder, FolderSnapshot{std::move(*cached), true});
                 continue;
@@ -428,7 +480,7 @@ Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCoun
         bool complete = true;
         auto tags = ScanTagsWithSnapshots({folder}, snapshots, stop, &complete);
         if (original && complete && !stop.stop_requested()) {
-            SaveCachedTags(path, *original, FindDesktopIniKeywords(original->text), tags, stop);
+            SaveCachedTags(path, *original, entry, tags, stop);
         }
         snapshots.emplace(folder, FolderSnapshot{std::move(tags), complete});
     }

@@ -9,8 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cwchar>
-#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -149,70 +147,6 @@ std::size_t LayoutCaptionWindows(const RECT& work, std::span<const LONG> widths,
     return CountOverlappingWindows(bounds);
 }
 
-namespace {
-
-std::wstring_view TrimIniValue(std::wstring_view value) {
-    const auto first = value.find_first_not_of(L" \t\r\n");
-    if (first == std::wstring_view::npos) return {};
-    return value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
-}
-
-std::wstring ReadIconIniValue(const std::filesystem::path& ini, const wchar_t* key) {
-    constexpr DWORD maxLength = 32768;
-    for (DWORD capacity = 512; capacity <= maxLength; capacity *= 2) {
-        std::wstring value(capacity, L'\0');
-        const DWORD length = GetPrivateProfileStringW(
-            L".ShellClassInfo", key, L"", value.data(), capacity, ini.c_str());
-        if (length < capacity - 1) {
-            value.resize(length);
-            return value;
-        }
-    }
-    return {};
-}
-
-std::optional<int> ParseIconIndex(std::wstring_view text) {
-    const std::wstring value(TrimIniValue(text));
-    wchar_t* end = nullptr;
-    const auto index = std::wcstoll(value.c_str(), &end, 10);
-    if (!end || end == value.c_str() || *end || index < std::numeric_limits<int>::min() ||
-        index > std::numeric_limits<int>::max()) return std::nullopt;
-    return static_cast<int>(index);
-}
-
-} // namespace
-
-std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder) {
-    const auto ini = folder / L"desktop.ini";
-    auto value = ReadIconIniValue(ini, L"IconResource");
-    int index = 0;
-    if (value.empty()) {
-        value = ReadIconIniValue(ini, L"IconFile");
-        index = ParseIconIndex(ReadIconIniValue(ini, L"IconIndex")).value_or(0);
-    } else if (const auto comma = value.rfind(L','); comma != std::wstring::npos) {
-        if (const auto parsed = ParseIconIndex(std::wstring_view(value).substr(comma + 1))) {
-            index = *parsed;
-            value.resize(comma);
-        }
-    }
-
-    auto path = TrimIniValue(value);
-    if (path.size() > 1 && path.front() == L'"' && path.back() == L'"') {
-        path = path.substr(1, path.size() - 2);
-    }
-    if (path.empty()) return std::nullopt;
-
-    const std::wstring input(path);
-    const DWORD capacity = ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
-    if (!capacity || capacity > 32768) return std::nullopt;
-    std::wstring expanded(capacity, L'\0');
-    const DWORD length = ExpandEnvironmentStringsW(input.c_str(), expanded.data(), capacity);
-    if (!length || length > capacity) return std::nullopt;
-    expanded.resize(length - 1);
-
-    return std::pair{(folder / expanded).lexically_normal(), index};
-}
-
 std::span<const std::filesystem::path> CaptionNoticeIconFolders(
     std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments) {
     return hasFolderArguments ? folders.subspan(defaultCount) : folders.first(defaultCount);
@@ -245,7 +179,7 @@ constexpr wchar_t kCaptionAppId[] = L"TagSearch.Caption";
 }
 
 HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::filesystem::path& shortcut,
-                             const std::pair<std::filesystem::path, int>& icon) {
+                             const IconResource& icon) {
     using Microsoft::WRL::ComPtr;
     ComPtr<IShellLinkW> link;
     HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
@@ -317,12 +251,13 @@ constexpr UINT kScanComplete = WM_APP + 2;
 constexpr UINT kReflow = WM_APP + 3;
 constexpr UINT kNoticeEvent = WM_APP + 4;
 constexpr UINT kSetTagMode = WM_APP + 5;
-constexpr UINT_PTR kClickFlashTimer = 1;
-constexpr UINT kClickFlashMs = 180;
+constexpr UINT_PTR kClickFeedbackTimer = 1;
+constexpr UINT kClickFeedbackMs = 180;
 constexpr UINT kScanStarted = WM_APP + 6;
 constexpr std::size_t kNoticeBodyLimit = std::extent_v<decltype(NOTIFYICONDATAW::szInfo)> - 1;
 constexpr DWORD kTagStyle = WS_POPUP | WS_CAPTION;
 constexpr DWORD kTagExStyle = WS_EX_TOOLWINDOW;
+constexpr int kTitlePadding = 6;
 using tagsearch::TagOperator;
 
 struct TagMode {
@@ -347,6 +282,8 @@ struct FloatingTag {
     bool pressed = false;
     bool dragging = false;
     bool moved = false;
+    bool clickFeedback = false;
+    bool coloredCaption = false;
     POINT start{};
     POINT last{};
     std::vector<tagsearch::TagSearchTerm> clickTerms;
@@ -358,7 +295,7 @@ struct ScanResult {
     bool success = false;
 };
 
-using IconResource = std::pair<std::filesystem::path, int>;
+using tagsearch::IconResource;
 using OwnedIcon = std::unique_ptr<std::remove_pointer_t<HICON>, decltype(&DestroyIcon)>;
 using NoticeIcons = std::map<IconResource, OwnedIcon>;
 
@@ -379,7 +316,7 @@ void RegisterCaptionShortcut() {
     if (!length || length >= executableName.size()) return;
     executableName.resize(length);
     const std::filesystem::path executable(executableName);
-    const auto resource = tagsearch::ReadCaptionIconResource(executable.parent_path());
+    const auto resource = tagsearch::ReadDesktopIniIcon(executable.parent_path());
     if (!resource || !ExtractCaptionIcon(*resource)) return;
 
     PWSTR programs = nullptr;
@@ -399,7 +336,7 @@ NoticeIcons LoadNoticeIcons(std::span<const std::filesystem::path> folders, std:
     NoticeIcons icons;
     for (const auto& folder : folders) {
         if (stop.stop_requested()) break;
-        auto resource = tagsearch::ReadCaptionIconResource(folder);
+        auto resource = tagsearch::ReadDesktopIniIcon(folder);
         if (!resource || icons.contains(*resource)) continue;
 
         auto icon = ExtractCaptionIcon(*resource);
@@ -475,21 +412,73 @@ bool HighContrastEnabled() {
            (contrast.dwFlags & HCF_HIGHCONTRASTON);
 }
 
-void ApplyTagColor(HWND window, TagOperator operation) {
-    const COLORREF color = HighContrastEnabled()
-        ? DWMWA_COLOR_DEFAULT : kTagModes[static_cast<std::size_t>(operation)].color;
-    DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &color, sizeof(color));
+COLORREF TagCaptionColor(TagOperator operation) {
+    return kTagModes[static_cast<std::size_t>(operation)].color;
 }
 
-void FlashClickedTag(HWND window) {
-    // A fixed DWM caption color can mask the native active/inactive flash.
-    if (!HighContrastEnabled() && SetTimer(window, kClickFlashTimer, kClickFlashMs, nullptr)) {
-        constexpr COLORREF highlight = RGB(255, 219, 130);
-        if (SUCCEEDED(DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &highlight, sizeof(highlight)))) return;
-        KillTimer(window, kClickFlashTimer);
+void ApplyTagColor(HWND window, FloatingTag& tag) {
+    const COLORREF color = HighContrastEnabled() ? DWMWA_COLOR_DEFAULT : TagCaptionColor(tag.operation);
+    const HRESULT result = DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &color, sizeof(color));
+    tag.coloredCaption = SUCCEEDED(result) && color != DWMWA_COLOR_DEFAULT;
+    const COLORREF text = tag.coloredCaption ? GetSysColor(COLOR_WINDOWTEXT) : DWMWA_COLOR_DEFAULT;
+    DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &text, sizeof(text));
+}
+
+HFONT CreateCaptionFont(UINT dpi, bool bold) {
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)) return nullptr;
+    if (bold) metrics.lfSmCaptionFont.lfWeight = FW_BOLD;
+    return CreateFontIndirectW(&metrics.lfSmCaptionFont);
+}
+
+bool PaintBoldCaption(HWND window, const FloatingTag& tag) {
+    RECT bounds{};
+    if (!GetWindowRect(window, &bounds)) return false;
+    const UINT dpi = WindowDpi(window);
+    const HFONT font = CreateCaptionFont(dpi, true);
+    if (!font) return false;
+    const HDC dc = GetWindowDC(window);
+    if (!dc) {
+        DeleteObject(font);
+        return false;
     }
-    FLASHWINFO flash{sizeof(flash), window, FLASHW_CAPTION, 1, kClickFlashMs};
-    FlashWindowEx(&flash);
+
+    const bool active = GetActiveWindow() == window;
+    const COLORREF background = tag.coloredCaption ? TagCaptionColor(tag.operation)
+        : GetSysColor(active ? COLOR_ACTIVECAPTION : COLOR_INACTIVECAPTION);
+    const COLORREF text = GetSysColor(tag.coloredCaption ? COLOR_WINDOWTEXT
+        : (active ? COLOR_CAPTIONTEXT : COLOR_INACTIVECAPTIONTEXT));
+    const RECT frame{0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top};
+    SetDCBrushColor(dc, background);
+    FillRect(dc, &frame, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+
+    const int padding = Scale(kTitlePadding, dpi);
+    RECT label{padding, 0, std::max<LONG>(padding, frame.right - padding), frame.bottom};
+    const auto previousFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, text);
+    DrawTextW(dc, tag.text.c_str(), -1, &label,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if (previousFont) SelectObject(dc, previousFont);
+    ReleaseDC(window, dc);
+    DeleteObject(font);
+    return true;
+}
+
+void ShowClickFeedback(HWND window, FloatingTag& tag) {
+    if (!SetTimer(window, kClickFeedbackTimer, kClickFeedbackMs, nullptr)) return;
+    if (tag.clickFeedback) return;
+
+    // The native title has no per-window font. Paint it while DWM's frame
+    // rendering (and its shadow) is temporarily disabled.
+    tag.clickFeedback = true;
+    constexpr DWMNCRENDERINGPOLICY policy = DWMNCRP_DISABLED;
+    if (FAILED(DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy)))) {
+        tag.clickFeedback = false;
+        KillTimer(window, kClickFeedbackTimer);
+        return;
+    }
+    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
 }
 
 std::vector<tagsearch::TagWindowBounds> VisibleTagsInZOrder(const Caption& caption) {
@@ -762,7 +751,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case WM_SYSCOLORCHANGE:
     case WM_SETTINGCHANGE:
     case WM_THEMECHANGED:
-        ApplyTagColor(window, tag->operation);
+        ApplyTagColor(window, *tag);
         break;
     case WM_MOUSEACTIVATE:
         // Mouse activation can raise a lower window before the click is dispatched.
@@ -816,7 +805,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
             tag->pressed = false;
             ReleaseCapture();
             if (clicked) {
-                FlashClickedTag(window);
+                ShowClickFeedback(window, *tag);
                 ActivateTag(window, *tag, std::move(terms));
             }
             if (moved) UpdateOverlapNotice(tag->caption);
@@ -829,11 +818,22 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         tag->moved = false;
         tag->clickTerms.clear();
         return 0;
-    case WM_TIMER:
-        if (wParam != kClickFlashTimer) break;
-        KillTimer(window, kClickFlashTimer);
-        ApplyTagColor(window, tag->operation);
+    case WM_NCPAINT:
+        if (tag->clickFeedback && PaintBoldCaption(window, *tag)) return 0;
+        break;
+    case WM_NCACTIVATE:
+        if (tag->clickFeedback) return TRUE;
+        break;
+    case WM_TIMER: {
+        if (wParam != kClickFeedbackTimer || !tag->clickFeedback) break;
+        KillTimer(window, kClickFeedbackTimer);
+        tag->clickFeedback = false;
+        constexpr DWMNCRENDERINGPOLICY policy = DWMNCRP_USEWINDOWSTYLE;
+        DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
+        ApplyTagColor(window, *tag);
+        RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
         return 0;
+    }
     case WM_KEYDOWN:
         if (wParam == VK_RETURN || wParam == VK_SPACE) {
             if ((HIWORD(lParam) & KF_REPEAT) == 0) ActivateTag(window, *tag, {});
@@ -851,7 +851,7 @@ LRESULT CALLBACK TagsProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
     case kSetTagMode:
         if (wParam > 0 && wParam <= std::size(kTagModes)) {
             tag->operation = kTagModes[wParam - 1].operation;
-            ApplyTagColor(window, tag->operation);
+            ApplyTagColor(window, *tag);
         }
         return 0;
     case WM_CLOSE:
@@ -878,24 +878,36 @@ bool PositionTags(Caption& caption, bool firstShow = false) {
     if (!AdjustWindowRectExForDpi(&frame, kTagStyle, FALSE, kTagExStyle, dpi) ||
         frame.bottom <= frame.top) return false;
 
-    NONCLIENTMETRICSW metrics{sizeof(metrics)};
-    const HFONT font = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)
-        ? CreateFontIndirectW(&metrics.lfSmCaptionFont) : nullptr;
+    const HFONT font = CreateCaptionFont(dpi, false);
+    const HFONT bold = CreateCaptionFont(dpi, true);
     const HDC dc = GetDC(caption.controller);
     const auto oldFont = dc && font ? SelectObject(dc, font) : nullptr;
     std::vector<LONG> widths;
     widths.reserve(caption.tags.size());
-    constexpr int titlePadding = 6;
     const LONG frameWidth = frame.right - frame.left;
     for (const auto& tag : caption.tags) {
         SIZE text{};
         if (dc) GetTextExtentPoint32W(dc, tag->text.c_str(), static_cast<int>(tag->text.size()), &text);
-        widths.push_back(text.cx + frameWidth + 2 * Scale(titlePadding, dpi));
+        widths.push_back(text.cx);
     }
+    if (dc && bold) {
+        const auto previousFont = SelectObject(dc, bold);
+        for (std::size_t i = 0; i < caption.tags.size(); ++i) {
+            const auto& text = caption.tags[i]->text;
+            SIZE extent{};
+            if (GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &extent)) {
+                widths[i] = std::max(widths[i], extent.cx);
+            }
+        }
+        if (previousFont) SelectObject(dc, previousFont);
+    }
+    const LONG chrome = frameWidth + 2 * Scale(kTitlePadding, dpi);
+    for (auto& width : widths) width += chrome;
     if (dc) {
         if (oldFont) SelectObject(dc, oldFont);
         ReleaseDC(caption.controller, dc);
     }
+    if (bold) DeleteObject(bold);
     if (font) DeleteObject(font);
 
     std::vector<RECT> bounds(widths.size());

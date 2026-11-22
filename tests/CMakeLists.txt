@@ -30,8 +30,8 @@ set(cases
     search_condition_keeps_one_tag_literal
     search_condition_combines_all_tags_with_and
     create_search_folder_accepts_combined_tags
-    caption_reads_desktop_ini_icon_resource
-    caption_reads_legacy_desktop_ini_icon
+    desktop_ini_reads_icon_resource
+    desktop_ini_reads_legacy_icon
     caption_notice_matches_sender_icon_or_has_none
     caption_selects_notice_icon_folders_by_arguments
     caption_shortcut_stores_icon_and_app_id

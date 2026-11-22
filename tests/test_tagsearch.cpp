@@ -23,13 +23,12 @@
 #include <vector>
 
 namespace tagsearch {
-std::optional<std::pair<std::filesystem::path, int>> ReadCaptionIconResource(const std::filesystem::path& folder);
 std::span<const std::filesystem::path> CaptionNoticeIconFolders(
     std::span<const std::filesystem::path> folders, std::size_t defaultCount, bool hasFolderArguments);
 HICON CreateCaptionNoticeTransportIcon();
 void ConfigureCaptionNoticeIcon(NOTIFYICONDATAW& notice, HICON icon, HICON transportIcon);
 HRESULT SaveCaptionShortcut(const std::filesystem::path& executable, const std::filesystem::path& shortcut,
-                             const std::pair<std::filesystem::path, int>& icon);
+                             const IconResource& icon);
 }
 
 namespace {
@@ -415,7 +414,7 @@ std::size_t CountCaptionIntersections(std::span<const RECT> windows, const RECT&
     return count;
 }
 
-void CaptionReadsDesktopIniIconResource() {
+void ReadsDesktopIniIconResource() {
     TestDirectory test;
     {
         const std::wstring ini =
@@ -426,22 +425,22 @@ void CaptionReadsDesktopIniIconResource() {
         Expect(file.good(), "the fixture should write a Unicode desktop.ini");
     }
 
-    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    const auto icon = tagsearch::ReadDesktopIniIcon(test.path);
     ExpectEqual(icon, std::optional{std::pair{test.path / L"icons" / L"标记, light.ico", -7}},
                 "IconResource should retain a quoted relative path and signed index");
-    Expect(!tagsearch::ReadCaptionIconResource(test.path / L"missing"),
+    Expect(!tagsearch::ReadDesktopIniIcon(test.path / L"missing"),
            "a folder without desktop.ini should not supply an icon");
 }
 
-void CaptionReadsLegacyDesktopIniIcon() {
+void ReadsLegacyDesktopIniIcon() {
     TestDirectory test;
     {
         std::ofstream file(test.path / L"desktop.ini");
-        file << "[.ShellClassInfo]\nIconFile=%SystemRoot%\\System32\\shell32.dll\nIconIndex=0\n";
+        file << "[.shellclassinfo]\nIconResource=\"\"\nIconFile=%SystemRoot%\\System32\\shell32.dll\nIconIndex=\"0\"\n";
         Expect(file.good(), "the fixture should write an ANSI desktop.ini");
     }
 
-    const auto icon = tagsearch::ReadCaptionIconResource(test.path);
+    const auto icon = tagsearch::ReadDesktopIniIcon(test.path);
     if (!icon) throw std::runtime_error("IconFile and IconIndex should supply a resource");
     Expect(icon->first.is_absolute() && icon->first.filename() == L"shell32.dll" && icon->second == 0,
            "the legacy icon should expand Windows environment variables and retain its index");
@@ -676,8 +675,8 @@ int main(int argc, char** argv) {
         {"search_condition_keeps_one_tag_literal", SearchConditionKeepsOneTagLiteral},
         {"search_condition_combines_all_tags_with_and", SearchConditionCombinesAllTagsWithAnd},
         {"create_search_folder_accepts_combined_tags", CreateSearchFolderAcceptsCombinedTags},
-        {"caption_reads_desktop_ini_icon_resource", CaptionReadsDesktopIniIconResource},
-        {"caption_reads_legacy_desktop_ini_icon", CaptionReadsLegacyDesktopIniIcon},
+        {"desktop_ini_reads_icon_resource", ReadsDesktopIniIconResource},
+        {"desktop_ini_reads_legacy_icon", ReadsLegacyDesktopIniIcon},
         {"caption_notice_matches_sender_icon_or_has_none", CaptionNoticeMatchesSenderIconOrHasNone},
         {"caption_selects_notice_icon_folders_by_arguments", CaptionSelectsNoticeIconFoldersByArguments},
         {"caption_shortcut_stores_icon_and_app_id", CaptionShortcutStoresIconAndAppId},

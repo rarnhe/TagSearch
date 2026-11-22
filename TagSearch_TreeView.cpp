@@ -89,14 +89,8 @@ void RegisterAppShortcut() {
         return;
     }
 
-    const auto config = exe.parent_path() / L"desktop.ini";
-    std::array<wchar_t, MAX_PATH> icon{};
-    if (GetPrivateProfileStringW(L".ShellClassInfo", L"IconResource", L"",
-                                 icon.data(), static_cast<DWORD>(icon.size()), config.c_str())) {
-        const int index = PathParseIconLocationW(icon.data());
-        if (icon[0]) {
-            link->SetIconLocation(icon.data(), index);
-        }
+    if (const auto icon = ReadDesktopIniIcon(exe.parent_path())) {
+        link->SetIconLocation(icon->first.c_str(), icon->second);
     }
 
     ComPtr<IPropertyStore> properties;
