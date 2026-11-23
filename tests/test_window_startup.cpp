@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
+#include <iterator>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -65,13 +67,21 @@ struct TestCopy {
 struct Process {
     PROCESS_INFORMATION info{};
 
-    explicit Process(const fs::path& executable, const tagsearch::Folders& folders = {}) {
+    explicit Process(const fs::path& executable, const tagsearch::Folders& folders = {},
+                     HANDLE redirectedOutput = nullptr) {
         STARTUPINFOW startup{sizeof(startup)};
+        if (redirectedOutput) {
+            startup.dwFlags = STARTF_USESTDHANDLES;
+            startup.hStdOutput = redirectedOutput;
+            startup.hStdError = redirectedOutput;
+            startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        }
         auto commandLine = L"\"" + executable.wstring() + L"\"";
         for (const auto& folder : folders) {
             commandLine += L" \"" + folder.wstring() + L"\"";
         }
-        Expect(CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
+        Expect(CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr,
+                              redirectedOutput != nullptr, 0,
                              nullptr, nullptr, &startup, &info) != FALSE,
                "CreateProcessW should launch TagSearch");
         CloseHandle(info.hThread);
@@ -199,9 +209,26 @@ void CheckFixedWindowAndTitle(const fs::path& executable) {
     ClosePanel(window, process);
 }
 
+void WriteDesktopIniCache(const fs::path& folder, const tagsearch::Tags& labels) {
+    const auto path = folder / L"desktop.ini";
+    std::wstring contents = L"\ufeff[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,";
+    bool first = true;
+    for (const auto& label : labels) {
+        if (!first) contents += L';';
+        contents += label;
+        first = false;
+    }
+    contents += L"\r\n";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(contents.data()),
+               static_cast<std::streamsize>(contents.size() * sizeof(wchar_t)));
+    Expect(file.good(), "the test must write a valid UTF-16 desktop.ini snapshot");
+}
+
 void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
     const TestCopy copy(executable);
     fs::copy_file(fixture, copy.directory / L"tagged.jpg");
+    WriteDesktopIniCache(copy.directory, {L"alpha", L"项目 & 资料"});
     const Process process(copy.executable, {copy.directory});
     const HWND panel = WaitForPanel(process);
     WaitForTitle(panel, copy.directory.filename().wstring());
@@ -237,6 +264,30 @@ void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
     ClosePanel(panel, process);
 }
 
+void CheckTerminalScanStatistics(const fs::path& executable) {
+    const TestCopy copy(executable);
+    const auto logPath = copy.directory / L"statistics.txt";
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    const HANDLE output = CreateFileW(logPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Expect(output != INVALID_HANDLE_VALUE, "the test needs a redirected standard output");
+
+    const Process process(copy.executable, {copy.directory}, output);
+    CloseHandle(output);
+    const HWND panel = WaitForPanel(process);
+    WaitForTitle(panel, copy.directory.filename().wstring());
+    ClosePanel(panel, process);
+
+    std::ifstream report(logPath, std::ios::binary);
+    const std::string result(std::istreambuf_iterator<char>{report}, std::istreambuf_iterator<char>{});
+    Expect(result.find("[TagSearch]") != std::string::npos &&
+           result.find("枚举文件数量=") != std::string::npos &&
+           result.find("Property Store 调用次数=") != std::string::npos &&
+           result.find("跳过目录数量=") != std::string::npos &&
+           result.find("总耗时=") != std::string::npos,
+           "GUI executables must write UTF-8 scan statistics when stdout is redirected");
+}
+
 void CheckTreeCache(const fs::path& executable, const fs::path& fixture) {
     const TestCopy copy(executable);
     const auto image = copy.directory / L"tagged.jpg";
@@ -254,18 +305,22 @@ void CheckTreeCache(const fs::path& executable, const fs::path& fixture) {
     };
 
     const Process cold(copy.executable, {copy.directory});
-    const auto count = countTags(cold);
-    Expect(count >= 2, "the cold TreeView launch should show the fixture tags");
+    const auto coldCount = countTags(cold);
     std::array<wchar_t, 256> keywords{};
     GetPrivateProfileStringW(L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}", L"Prop5", L"",
                              keywords.data(), static_cast<DWORD>(keywords.size()), ini.c_str());
-    const std::wstring_view value(keywords.data());
-    Expect(value.starts_with(L"31,") && value.find(L"项目 & 资料") != std::wstring_view::npos,
-           "TreeView should write the requested directory's Unicode tag cache");
+    Expect(std::wstring_view(keywords.data()) == L"31,",
+           "a JPG-only folder must write an empty document-only cache");
 
+    WriteDesktopIniCache(copy.directory, {L"alpha", L"项目 & 资料"});
     fs::remove(image);
     const Process warm(copy.executable, {copy.directory});
-    Expect(countTags(warm) == count, "TreeView should recover the same rows from desktop.ini on next launch");
+    const auto count = countTags(warm);
+    Expect(count >= 2 && count >= coldCount,
+           "TreeView should display saved tags without rescanning JPEG");
+
+    const Process repeated(copy.executable, {copy.directory});
+    Expect(countTags(repeated) == count, "the valid cache should be reused across restarts");
 }
 
 struct VisibleTags {
@@ -352,6 +407,7 @@ bool HasIntersection(const std::vector<RECT>& bounds) {
 void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     const TestCopy copy(executable);
     fs::copy_file(fixture, copy.directory / L"tagged.jpg");
+    WriteDesktopIniCache(copy.directory, {L"alpha", L"项目 & 资料"});
     const Process first(copy.executable, {copy.directory});
     const HWND controller = WaitForPanel(first, L"TagSearchCaptionController", false);
     MONITORINFO monitor{sizeof(monitor)};
@@ -363,9 +419,23 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     const DWORD threadId = GetWindowThreadProcessId(controller, nullptr);
     Expect(WaitUntil([&] {
         ReadVisibleCaptionTags(threadId, tags);
-        return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
-               std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
-    }), "the background scan should show both labels from the JPEG fixture");
+        if (std::find(tags.titles.begin(), tags.titles.end(), L"alpha") == tags.titles.end() ||
+            std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") == tags.titles.end()) {
+            return false;
+        }
+        // A visible window can appear during its initial DWM/client-area update.
+        // Check settled window dimensions before inspecting the final layout.
+        for (std::size_t i = 0; i < tags.windows.size(); ++i) {
+            RECT current{}, client{};
+            if (!GetWindowRect(tags.windows[i], &current) || !GetClientRect(tags.windows[i], &client) ||
+                !EqualRect(&current, &tags.bounds[i]) ||
+                client.right != current.right - current.left ||
+                client.bottom != current.bottom - current.top) {
+                return false;
+            }
+        }
+        return true;
+    }), "the background scan should display and lay out the two cached labels");
     Expect(!tags.unexpectedVisibleWindow && !IsWindowVisible(controller),
            "only real tag windows should be visible after the scan");
     CheckTagBounds(tags, monitor.rcWork);
@@ -389,21 +459,6 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     ClosePanel(controller, first);
 }
 
-void WriteTagFixture(const fs::path& source, const fs::path& target, const tagsearch::Tags& titles) {
-    fs::copy_file(source, target);
-    Microsoft::WRL::ComPtr<IPropertyStore> store;
-    Expect(SUCCEEDED(SHGetPropertyStoreFromParsingName(target.c_str(), nullptr, GPS_READWRITE,
-                                                       IID_PPV_ARGS(store.GetAddressOf()))),
-           "the crowded JPEG fixture should support writing keywords");
-    std::vector<PCWSTR> names;
-    for (const auto& title : titles) names.push_back(title.c_str());
-    PROPVARIANT value{};
-    const auto initialized = InitPropVariantFromStringVector(names.data(), static_cast<ULONG>(names.size()), &value);
-    const auto written = SUCCEEDED(initialized) ? store->SetValue(PKEY_Keywords, value) : initialized;
-    PropVariantClear(&value);
-    Expect(SUCCEEDED(written) && SUCCEEDED(store->Commit()), "the crowded JPEG fixture should persist its tags");
-}
-
 void CheckCrowdedCaption(const fs::path& executable, const fs::path& fixture) {
     const TestCopy copy(executable);
     MONITORINFO monitor{sizeof(monitor)};
@@ -420,21 +475,12 @@ void CheckCrowdedCaption(const fs::path& executable, const fs::path& fixture) {
     const LONG count = rows * (1 + (work.right - work.left) / titleWidth) + 8;
     constexpr std::wstring_view prefix = L"Crowded test tag ";
 
-    Expect(SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)), "the fixture writer requires COM");
-    try {
-        constexpr LONG tagsPerImage = 8;
-        for (LONG start = 0; start < count; start += tagsPerImage) {
-            tagsearch::Tags titles;
-            for (LONG i = start; i < std::min(count, start + tagsPerImage); ++i) {
-                titles.push_back(std::wstring(prefix) + std::to_wstring(i) + L" " + std::wstring(120, L'M'));
-            }
-            WriteTagFixture(fixture, copy.directory / (std::to_wstring(start) + L".jpg"), titles);
-        }
-    } catch (...) {
-        CoUninitialize();
-        throw;
+    tagsearch::Tags titles;
+    titles.reserve(static_cast<std::size_t>(count));
+    for (LONG i = 0; i < count; ++i) {
+        titles.push_back(std::wstring(prefix) + std::to_wstring(i) + L" " + std::wstring(120, L'M'));
     }
-    CoUninitialize();
+    WriteDesktopIniCache(copy.directory, titles);
 
     const Process process(copy.executable, {copy.directory});
     const HWND controller = WaitForPanel(process, L"TagSearchCaptionController", false);
@@ -465,6 +511,8 @@ int wmain(int argc, wchar_t** argv) {
             CheckFixedWindowAndTitle(argv[2]);
         } else if (mode == L"treeview-blank-click" && argc == 4) {
             CheckTreeBlankClick(argv[2], argv[3]);
+        } else if (mode == L"treeview-stdout" && argc == 3) {
+            CheckTerminalScanStatistics(argv[2]);
         } else if (mode == L"treeview-cache" && argc == 4) {
             CheckTreeCache(argv[2], argv[3]);
         } else if (mode == L"caption" && argc == 4) {

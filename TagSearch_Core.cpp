@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -59,7 +60,8 @@ void AddKnownFolder(Folders& folders, REFKNOWNFOLDERID id) {
     }
 }
 
-void ReadItemTags(const fs::path& item, Tags& tags) {
+void ReadItemTags(const fs::path& item, Tags& tags, ScanStatistics* statistics = nullptr) {
+    if (statistics) ++statistics->propertyStoreCalls;
     ComPtr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreFromParsingName(
             item.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(store.GetAddressOf())))) {
@@ -139,33 +141,33 @@ COLORREF WindowAccentColor() {
 }
 
 Tags NormalizeTags(Tags tags) {
+    // Preserve the first-seen order, including the order inside a cached Prop5 list.
     std::set<std::wstring> distinct;
+    Tags normalized;
+    normalized.reserve(tags.size());
     for (const auto& tag : tags) {
-        std::wstring trimmed = TrimWhitespace(tag);
-        if (!trimmed.empty()) {
-            distinct.insert(std::move(trimmed));
+        auto trimmed = TrimWhitespace(tag);
+        if (!trimmed.empty() && distinct.insert(trimmed).second) {
+            normalized.push_back(std::move(trimmed));
         }
     }
-
-    Tags normalized(distinct.begin(), distinct.end());
-
-    try {
-        const std::locale userLocale("");
-        const auto& collate = std::use_facet<std::collate<wchar_t>>(userLocale);
-        std::sort(
-            normalized.begin(),
-            normalized.end(),
-            [&collate](const std::wstring& left, const std::wstring& right) {
-                return collate.compare(
-                    left.data(), left.data() + left.size(),
-                    right.data(), right.data() + right.size()) < 0;
-            });
-    }
-    catch (...) {
-        std::sort(normalized.begin(), normalized.end());
-    }
-
     return normalized;
+}
+
+bool ShouldScanTagFile(const fs::path& path) {
+    constexpr std::array<std::wstring_view, 7> extensions{
+        L".xls", L".ppt", L".doc", L".pptx", L".xlsx", L".pdf", L".docx"
+    };
+    const auto extension = path.extension().native();
+    return std::any_of(extensions.begin(), extensions.end(), [&](std::wstring_view allowed) {
+        return CompareStringOrdinal(extension.c_str(), static_cast<int>(extension.size()),
+                                    allowed.data(), static_cast<int>(allowed.size()), TRUE) == CSTR_EQUAL;
+    });
+}
+
+bool ShouldSkipTagDirectory(const fs::path& path) {
+    const auto name = path.filename().native();
+    return !name.empty() && name.front() == L'.';
 }
 
 Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCount) {
@@ -181,6 +183,14 @@ Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCou
         AddFolder(folders, arguments.get()[i]);
     }
     return folders;
+}
+
+bool EnableFolderDesktopIniCustomization(const fs::path& folder) {
+    const DWORD attributes = GetFileAttributesW(folder.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    if (attributes & FILE_ATTRIBUTE_READONLY) return true;
+    // The directory's +R bit opts into Explorer's desktop.ini customization.
+    return SetFileAttributesW(folder.c_str(), attributes | FILE_ATTRIBUTE_READONLY) != FALSE;
 }
 
 namespace {
@@ -314,7 +324,7 @@ std::optional<Tags> ReadCachedTags(const DesktopIni& ini, const IniEntry& entry)
 }
 
 void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniEntry& entry,
-                    const Tags& tags, std::stop_token stop) {
+                    const Tags& tags, bool defaultFolder, std::stop_token stop) {
     // The Windows Prop5 list has no escape syntax for semicolons or line breaks.
     constexpr std::wstring_view unsupported(L";\r\n\0", 4);
     constexpr std::wstring_view prefix = L"Prop5=31,";
@@ -326,7 +336,7 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniE
     }
 
     auto text = original.text;
-    if (text.empty()) {
+    if (text.empty() && !defaultFolder) {
         text = kShellClassInfo;
         text += L"\r\nInfoTip=\r\nIconResource=\r\n";
     }
@@ -359,6 +369,8 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniE
         written == length && FlushFileBuffers(file);
     CloseHandle(file);
 
+    // Only mark the folder customized after its desktop.ini is safely committed.
+    bool committed = false;
     // If another program edited desktop.ini during the scan, leave that version in place.
     if (ready && !stop.stop_requested()) {
         const auto current = ReadDesktopIni(path);
@@ -371,22 +383,27 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniE
                     auto backup = temp;
                     backup += L".bak";
                     if (ReplaceFileW(path.c_str(), temp.c_str(), backup.c_str(), 0, nullptr, nullptr)) {
+                        committed = true;
                         DeleteFileW(backup.c_str());
                     } else if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
                                GetLastError() == ERROR_FILE_NOT_FOUND) {
-                        MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+                        committed = MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
                     }
                 }
             } else {
-                MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+                committed = MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
             }
         }
     }
     DeleteFileW(temp.c_str());
+    if (committed && EnableFolderDesktopIniCustomization(path.parent_path())) {
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, path.parent_path().c_str(), nullptr);
+    }
 }
 
 Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapshots,
-                           std::stop_token stop, bool* complete = nullptr) {
+                           std::stop_token stop, bool* complete = nullptr,
+                           ScanStatistics* statistics = nullptr, bool filtered = false) {
     Tags tags;
     Folders pending = folders;
     std::set<fs::path> visited;
@@ -396,6 +413,10 @@ Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapsh
         if (!visited.insert(folder).second) {
             continue;
         }
+        if (filtered && ShouldSkipTagDirectory(folder)) {
+            if (statistics) ++statistics->skippedDirectories;
+            continue;
+        }
 
         if (const auto cached = snapshots.find(folder); cached != snapshots.end()) {
             tags.insert(tags.end(), cached->second.tags.begin(), cached->second.tags.end());
@@ -403,7 +424,7 @@ Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapsh
             continue;
         }
 
-        ReadItemTags(folder, tags);
+        ReadItemTags(folder, tags, statistics);
         std::error_code error;
         const auto options = complete ? fs::directory_options::none : fs::directory_options::skip_permission_denied;
         for (fs::directory_iterator entry(folder, options, error), end;
@@ -415,7 +436,12 @@ Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapsh
                 continue;
             }
             if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-                ReadItemTags(path, tags);
+                if (statistics) ++statistics->enumeratedFiles;
+                if (!filtered || ShouldScanTagFile(path)) ReadItemTags(path, tags, statistics);
+                continue;
+            }
+            if (filtered && ShouldSkipTagDirectory(path)) {
+                if (statistics) ++statistics->skippedDirectories;
                 continue;
             }
 
@@ -429,7 +455,7 @@ Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapsh
                 constexpr DWORD nameSurrogateBit = 0x20000000;
                 if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
                     (data.dwReserved0 & nameSurrogateBit)) {
-                    ReadItemTags(path, tags);
+                    ReadItemTags(path, tags, statistics);
                     continue;
                 }
             }
@@ -474,35 +500,100 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
     return ScanTagsWithSnapshots(folders, {}, stop);
 }
 
-Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop) {
-    const auto requestedFolders = std::span(folders).subspan(defaultCount);
-    Folders ordered(requestedFolders.begin(), requestedFolders.end());
-    // Resolve children first so a parent scan can reuse any explicitly requested child snapshot.
-    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-        return left.native().size() > right.native().size();
-    });
-
-    FolderSnapshots snapshots;
-    for (const auto& folder : ordered) {
-        if (stop.stop_requested()) return {};
-        const auto path = folder / kDesktopIniName;
-        const auto original = ReadDesktopIni(path);
-        IniEntry entry;
-        if (original) {
-            entry = FindIniEntry(original->text, kSummarySection, L"Prop5");
-            if (auto cached = ReadCachedTags(*original, entry)) {
-                snapshots.emplace(folder, FolderSnapshot{std::move(*cached), true});
-                continue;
+namespace {
+void PrintScanStatistics(const ScanStatistics& statistics) {
+    // Both front ends are WIN32 (GUI-subsystem) executables. A standard
+    // std::wcout stream need not be connected to the invoking terminal.
+    const std::wstring line =
+        L"[TagSearch] 枚举文件数量=" + std::to_wstring(statistics.enumeratedFiles) +
+        L"  Property Store 调用次数=" + std::to_wstring(statistics.propertyStoreCalls) +
+        L"  跳过目录数量=" + std::to_wstring(statistics.skippedDirectories) +
+        L"  总耗时=" + std::to_wstring(statistics.elapsedMilliseconds) + L" ms" +
+        L"  缓存命中目录=" + std::to_wstring(statistics.cachedRoots) +
+        L"  实际扫描目录=" + std::to_wstring(statistics.scannedRoots) + L"\r\n";
+    auto output = GetStdHandle(STD_OUTPUT_HANDLE);
+    const bool missing = !output || output == INVALID_HANDLE_VALUE ||
+        GetFileType(output) == FILE_TYPE_UNKNOWN;
+    bool attached = false;
+    if (missing) {
+        attached = AttachConsole(ATTACH_PARENT_PROCESS) != FALSE;
+        if (attached) output = GetStdHandle(STD_OUTPUT_HANDLE);
+    }
+    if (output && output != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        DWORD mode = 0;
+        if (GetConsoleMode(output, &mode)) {
+            WriteConsoleW(output, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr);
+        } else {
+            const auto length = WideCharToMultiByte(CP_UTF8, 0, line.c_str(),
+                                                     static_cast<int>(line.size()), nullptr, 0, nullptr, nullptr);
+            if (length > 0) {
+                std::string bytes(static_cast<std::size_t>(length), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()),
+                                    bytes.data(), length, nullptr, nullptr);
+                WriteFile(output, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
             }
         }
-        bool complete = true;
-        auto tags = ScanTagsWithSnapshots({folder}, snapshots, stop, &complete);
-        if (original && complete && !stop.stop_requested()) {
-            SaveCachedTags(path, *original, entry, tags, stop);
-        }
-        snapshots.emplace(folder, FolderSnapshot{std::move(tags), complete});
     }
-    return ScanTagsWithSnapshots(folders, snapshots, stop);
+    if (attached) FreeConsole();
+}
+} // namespace
+
+Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount,
+                                 std::stop_token stop, ScanStatistics* statistics) {
+    const ULONGLONG started = GetTickCount64();
+    ScanStatistics collected;
+    // Keep each root independent: every snapshot contains only that root's recursive
+    // tags, never a union of other requested roots. The root order is the caller's
+    // order (Desktop, Downloads, then command-line folders).
+    struct PerFolderTags {
+        fs::path folder;
+        Tags tags;
+    };
+    std::vector<PerFolderTags> perFolder;
+    perFolder.reserve(folders.size());
+
+    for (std::size_t index = 0; index < folders.size(); ++index) {
+        if (stop.stop_requested()) break;
+        const auto& folder = folders[index];
+        if (ShouldSkipTagDirectory(folder)) {
+            ++collected.skippedDirectories;
+            continue;
+        }
+        const auto iniPath = folder / kDesktopIniName;
+        const auto original = ReadDesktopIni(iniPath);
+        IniEntry entry;
+        Tags tags;
+        bool cached = false;
+        if (original) {
+            entry = FindIniEntry(original->text, kSummarySection, L"Prop5");
+            if (auto saved = ReadCachedTags(*original, entry)) {
+                tags = std::move(*saved);
+                cached = true;
+                ++collected.cachedRoots;
+            }
+        }
+        if (!cached) {
+            ++collected.scannedRoots;
+            bool complete = true;
+            // Scan each root on its own. Nested explicit roots cannot replace the
+            // parent's own complete snapshot with a stale child snapshot.
+            tags = ScanTagsWithSnapshots({folder}, {}, stop, &complete, &collected, true);
+            if (original && complete && !stop.stop_requested()) {
+                SaveCachedTags(iniPath, *original, entry, tags, index < defaultCount, stop);
+            }
+        }
+        perFolder.push_back({folder, std::move(tags)});
+    }
+
+    Tags combined;
+    for (const auto& snapshot : perFolder) {
+        combined.insert(combined.end(), snapshot.tags.begin(), snapshot.tags.end());
+    }
+    collected.elapsedMilliseconds = GetTickCount64() - started;
+    if (statistics) *statistics = collected;
+    PrintScanStatistics(collected);
+    return stop.stop_requested() ? Tags{} : NormalizeTags(std::move(combined));
 }
 
 std::vector<TagSearchTerm> TermsForOverlappingWindows(
