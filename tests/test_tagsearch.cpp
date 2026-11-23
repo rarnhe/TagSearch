@@ -255,7 +255,7 @@ void CachesRequestedFoldersIndependently() {
                 "a missing explicit cache should regenerate its own empty list");
 }
 
-void ScansDefaultRootsLiveAndRepairsInvalidCache() {
+void CachesDefaultRootsAndRepairsInvalidCache() {
     TestDirectory test;
     const auto desktop = test.path / L"Desktop";
     const auto downloads = test.path / L"Downloads";
@@ -312,7 +312,7 @@ void ScansDefaultRootsLiveAndRepairsInvalidCache() {
                 "the regenerated default cache must not invent ShellClassInfo");
 }
 
-void CombinesWarmAndColdNestedFolders() {
+void KeepsParentAndChildSnapshotsSeparate() {
     TestDirectory test;
     const auto parent = test.path / L"Parent";
     const auto child = parent / L"Child";
@@ -352,7 +352,7 @@ void CacheRequiresCanonicalSummarySection() {
     ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({folder}, 0), actual,
                 "a Prop5 in an unrelated section must never be considered a valid cache");
     const auto saved = ReadDesktopIniUtf16(ini);
-    Expect(saved.find(L"\r\n[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,") != std::wstring::npos,
+    Expect(saved.find(L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,") != std::wstring::npos,
            "the canonical section and its Prop5 must be on two distinct adjacent lines");
     Expect(saved.find(L"Prop5=31,wrong-section-value") != std::wstring::npos,
            "repair must preserve unrelated ini fields");
@@ -826,8 +826,8 @@ int main(int argc, char** argv) {
         {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
         {"scan_tags_reads_nested_shell_properties_without_using_cache", ScanTagsReadsNestedShellPropertiesWithoutUsingCache},
         {"tag_cache_stores_requested_folders_independently", CachesRequestedFoldersIndependently},
-        {"tag_cache_scans_default_roots_live_and_repairs_invalid_cache", ScansDefaultRootsLiveAndRepairsInvalidCache},
-        {"tag_cache_combines_warm_and_cold_nested_folders", CombinesWarmAndColdNestedFolders},
+        {"tag_cache_default_roots_use_cache_and_repair_invalid_cache", CachesDefaultRootsAndRepairsInvalidCache},
+        {"tag_cache_nested_roots_keep_independent_snapshots", KeepsParentAndChildSnapshotsSeparate},
         {"tag_cache_requires_canonical_summary_section", CacheRequiresCanonicalSummarySection},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},

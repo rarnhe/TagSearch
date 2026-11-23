@@ -21,8 +21,8 @@ set(cases
     resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs
     scan_tags_reads_nested_shell_properties_without_using_cache
     tag_cache_stores_requested_folders_independently
-    tag_cache_scans_default_roots_live_and_repairs_invalid_cache
-    tag_cache_combines_warm_and_cold_nested_folders
+    tag_cache_default_roots_use_cache_and_repair_invalid_cache
+    tag_cache_nested_roots_keep_independent_snapshots
     tag_cache_requires_canonical_summary_section
     create_search_folder_accepts_multiple_scopes_and_literal_tag
     create_search_folder_rejects_empty_scope
