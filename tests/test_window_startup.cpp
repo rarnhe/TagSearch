@@ -66,13 +66,21 @@ struct TestCopy {
 struct Process {
     PROCESS_INFORMATION info{};
 
-    explicit Process(const fs::path& executable, const tagsearch::Folders& folders = {}) {
+    explicit Process(const fs::path& executable, const tagsearch::Folders& folders = {},
+                     HANDLE redirectedOutput = nullptr) {
         STARTUPINFOW startup{sizeof(startup)};
+        if (redirectedOutput) {
+            startup.dwFlags = STARTF_USESTDHANDLES;
+            startup.hStdOutput = redirectedOutput;
+            startup.hStdError = redirectedOutput;
+            startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        }
         auto commandLine = L"\"" + executable.wstring() + L"\"";
         for (const auto& folder : folders) {
             commandLine += L" \"" + folder.wstring() + L"\"";
         }
-        Expect(CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
+        Expect(CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr,
+                              redirectedOutput != nullptr, 0,
                              nullptr, nullptr, &startup, &info) != FALSE,
                "CreateProcessW should launch TagSearch");
         CloseHandle(info.hThread);
@@ -253,6 +261,36 @@ void CheckTreeBlankClick(const fs::path& executable, const fs::path& fixture) {
     Expect(caret() == selected, "a blank click should preserve an existing selection");
 
     ClosePanel(panel, process);
+}
+
+void CheckTerminalScanStatistics(const fs::path& executable) {
+    const TestCopy copy(executable);
+    const auto logPath = copy.directory / L"statistics.txt";
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    const HANDLE output = CreateFileW(logPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    Expect(output != INVALID_HANDLE_VALUE, "the test needs a redirected standard output");
+
+    try {
+        const Process process(copy.executable, {copy.directory}, output);
+        CloseHandle(output);
+        const HWND panel = WaitForPanel(process);
+        WaitForTitle(panel, copy.directory.filename().wstring());
+        ClosePanel(panel, process);
+    } catch (...) {
+        // A close is harmless if the handle was already closed by CreateProcess.
+        // The caller's RAII process object still terminates on exceptions.
+        throw;
+    }
+
+    std::ifstream report(logPath, std::ios::binary);
+    const std::string result(std::istreambuf_iterator<char>{report}, std::istreambuf_iterator<char>{});
+    Expect(result.find("[TagSearch]") != std::string::npos &&
+           result.find("枚举文件数量=") != std::string::npos &&
+           result.find("Property Store 调用次数=") != std::string::npos &&
+           result.find("跳过目录数量=") != std::string::npos &&
+           result.find("总耗时=") != std::string::npos,
+           "GUI executables must write UTF-8 scan statistics when stdout is redirected");
 }
 
 void CheckTreeCache(const fs::path& executable, const fs::path& fixture) {
@@ -464,6 +502,8 @@ int wmain(int argc, wchar_t** argv) {
             CheckFixedWindowAndTitle(argv[2]);
         } else if (mode == L"treeview-blank-click" && argc == 4) {
             CheckTreeBlankClick(argv[2], argv[3]);
+        } else if (mode == L"treeview-stdout" && argc == 3) {
+            CheckTerminalScanStatistics(argv[2]);
         } else if (mode == L"treeview-cache" && argc == 4) {
             CheckTreeCache(argv[2], argv[3]);
         } else if (mode == L"caption" && argc == 4) {
