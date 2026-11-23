@@ -15,7 +15,7 @@ set(cases
     split_keywords_basic
     split_keywords_trims_whitespace
     split_keywords_ignores_empty
-    normalize_tags_deduplicates_and_sorts
+    normalize_tags_preserves_first_seen_order
     normalize_tags_discards_empty
     resolve_folders_keeps_known_folders
     resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs
@@ -23,6 +23,7 @@ set(cases
     tag_cache_stores_requested_folders_independently
     tag_cache_scans_default_roots_live_and_repairs_invalid_cache
     tag_cache_combines_warm_and_cold_nested_folders
+    tag_cache_requires_canonical_summary_section
     create_search_folder_accepts_multiple_scopes_and_literal_tag
     create_search_folder_rejects_empty_scope
     overlap_finds_all_direct_intersections

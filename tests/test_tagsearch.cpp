@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -71,11 +72,11 @@ void SplitKeywordsIgnoresEmpty() {
         "empty and whitespace-only keywords should be ignored");
 }
 
-void NormalizeTagsDeduplicatesAndSorts() {
+void NormalizeTagsPreservesFirstSeenOrder() {
     ExpectEqual(
-        tagsearch::NormalizeTags({L"beta", L"alpha", L"beta", L" alpha "}),
-        std::vector<std::wstring>{L"alpha", L"beta"},
-        "normalization should trim, deduplicate and sort tags");
+        tagsearch::NormalizeTags({L"beta", L"alpha", L"beta", L" alpha ", L"gamma", L"beta"}),
+        std::vector<std::wstring>{L"beta", L"alpha", L"gamma"},
+        "stable deduplication must retain the first tag occurrence");
 }
 
 void NormalizeTagsDiscardsEmpty() {
@@ -179,55 +180,79 @@ std::wstring IniValue(const fs::path& ini, const wchar_t* section, const wchar_t
 
 constexpr wchar_t summarySection[] = L"{F29F85E0-4FF9-1068-AB91-08002B27B3D9}";
 
+std::wstring ReadDesktopIniUtf16(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    const std::string bytes(std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
+    Expect(input.eof() || input.good(), "desktop.ini must be readable");
+    Expect(bytes.size() % sizeof(wchar_t) == 0, "desktop.ini must contain complete UTF-16 units");
+    std::wstring text(bytes.size() / sizeof(wchar_t), L'\0');
+    if (!bytes.empty()) std::memcpy(text.data(), bytes.data(), bytes.size());
+    return text;
+}
+
+void ExpectReadOnlyFolder(const fs::path& path) {
+    const auto attributes = GetFileAttributesW(path.c_str());
+    Expect(attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+           (attributes & FILE_ATTRIBUTE_READONLY) != 0,
+           "successfully written cache must set the containing folder's +R attribute");
+}
+
 void CachesRequestedFoldersIndependently() {
     TestDirectory test;
+    const auto desktop = test.path / L"Desktop";
     const auto first = test.path / L"Folder A";
     const auto second = test.path / L"Folder B";
+    fs::create_directory(desktop);
     fs::create_directories(first / L"nested");
     fs::create_directory(second);
     fs::copy_file(fixturePath, first / L"nested" / L"tags.jpg");
     fs::copy_file(fixturePath, first / L"duplicate.jpg");
 
+    const auto desktopIni = desktop / L"desktop.ini";
     const auto firstIni = first / L"desktop.ini";
     const auto secondIni = second / L"desktop.ini";
     std::ofstream(firstIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
                               "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp2=31,Folder title\n"
                               "[Other]\nProp5=31,unrelated\n";
+    const auto ownFirst = tagsearch::ScanTags({first});
+    const tagsearch::Folders folders{desktop, first, second};
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), ownFirst,
+                "all roots should merge in order, without inheriting sibling metadata");
 
-    const tagsearch::Folders folders{test.path, first, second};
-    const auto expected = tagsearch::NormalizeTags({L"alpha", L"项目 & 资料"});
-    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), expected,
-                "a cold scan should merge deduplicated tags from requested directories");
     const auto firstKeywords = IniValue(firstIni, summarySection, L"Prop5");
     Expect(firstKeywords.starts_with(L"31,"), "the first directory should store a summary value");
-    ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(firstKeywords).substr(3))),
-                expected, "the first directory should store its own Unicode tag list");
-    {
-        std::ifstream ini(secondIni, std::ios::binary);
-        const std::string contents(std::istreambuf_iterator<char>{ini}, std::istreambuf_iterator<char>{});
-        const std::wstring expectedIni = L"\ufeff[.ShellClassInfo]\r\nInfoTip=\r\nIconResource=\r\n"
-            L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,\r\n";
-        ExpectEqual(contents, std::string(reinterpret_cast<const char*>(expectedIni.data()),
-                                         expectedIni.size() * sizeof(wchar_t)),
-                    "a new desktop.ini should use the shell template and store an empty tag list");
-    }
+    ExpectEqual(tagsearch::SplitKeywords(std::wstring_view(firstKeywords).substr(3)), ownFirst,
+                "the first directory should store its own ordered Unicode tag list");
+    ExpectEqual(ReadDesktopIniUtf16(desktopIni),
+                std::wstring(L"\ufeff[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,\r\n"),
+                "an uncached default directory must create ONLY the fixed summary section and property line");
+    ExpectEqual(ReadDesktopIniUtf16(secondIni),
+                std::wstring(L"\ufeff[.ShellClassInfo]\r\nInfoTip=\r\nIconResource=\r\n"
+                             L"[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,\r\n"),
+                "an uncached explicit directory must use the complete canonical template");
+    ExpectReadOnlyFolder(desktop);
+    ExpectReadOnlyFolder(first);
+    ExpectReadOnlyFolder(second);
+
     ExpectEqual(IniValue(firstIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
-                "writing the cache should preserve custom folder icons");
+                "updating a cache must preserve custom icons");
     ExpectEqual(IniValue(firstIni, summarySection, L"Prop2"), std::wstring(L"31,Folder title"),
-                "writing the cache should preserve other summary values");
+                "updating a cache must preserve other summary properties");
     ExpectEqual(IniValue(firstIni, L"Other", L"Prop5"), std::wstring(L"31,unrelated"),
-                "only Prop5 in the summary section belongs to the cache");
-    Expect(!fs::exists(test.path / L"desktop.ini"), "implicit roots should not get a cache");
+                "an unrelated Prop5 outside the fixed section must remain untouched");
 
     fs::remove_all(first / L"nested");
     fs::remove(first / L"duplicate.jpg");
     fs::copy_file(fixturePath, second / L"new.jpg");
-    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), expected,
-                "a warm run should reuse the stored snapshot after the original files are removed");
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), ownFirst,
+                "warm caches must not rescan changed contents, including empty cached lists");
 
     fs::remove(firstIni);
     Expect(tagsearch::ScanTagsWithDesktopIniCache(folders, 1).empty(),
-           "an empty cache should skip newly added files even when an implicit root contains it");
+           "a missing cache must rescan just that root; other snapshots remain unchanged");
+    ExpectEqual(IniValue(firstIni, summarySection, L"Prop5"), std::wstring(L"31,"),
+                "a missing explicit cache should regenerate its own empty list");
 }
 
 void ScansDefaultRootsLiveAndRepairsInvalidCache() {
@@ -239,46 +264,99 @@ void ScansDefaultRootsLiveAndRepairsInvalidCache() {
     for (const auto& folder : {desktop, downloads, first, second}) fs::create_directory(folder);
 
     const auto desktopIni = desktop / L"desktop.ini";
+    const auto downloadsIni = downloads / L"desktop.ini";
     const auto firstIni = first / L"desktop.ini";
     const auto secondIni = second / L"desktop.ini";
-    std::ofstream(desktopIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=31,desktop value\n";
-    std::ofstream(firstIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=31,cached A;cached A\n";
+    std::ofstream(desktopIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\n"
+                                 "Prop5=31,desktop value;duplicated\n";
+    std::ofstream(firstIni) << "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\n"
+                               "Prop5=31,cached A;duplicated;cached A\n";
     std::ofstream(secondIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
-                               "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=19,invalid cache\n";
-    fs::copy_file(fixturePath, desktop / L"live.jpg");
-
-    // A live Shell read can expose a folder's own metadata, so compare against its actual live tags.
-    auto expected = tagsearch::ScanTags({desktop, downloads});
-    Expect(std::find(expected.begin(), expected.end(), L"alpha") != expected.end(),
-           "the default desktop fixture should provide a live file tag");
-    expected.push_back(L"cached A");
+                                "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=19,invalid cache\n";
+    fs::copy_file(fixturePath, desktop / L"ignored-because-cached.jpg");
+    fs::copy_file(fixturePath, downloads / L"scanned.jpg");
+    const auto downloadsOwnTags = tagsearch::ScanTags({downloads});
     const tagsearch::Folders folders{desktop, downloads, first, second};
-    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 2), tagsearch::NormalizeTags(std::move(expected)),
-                "default live tags and explicit cached tags should be combined and deduplicated");
-    ExpectEqual(IniValue(desktopIni, summarySection, L"Prop5"), std::wstring(L"31,desktop value"),
-                "an existing default desktop.ini should be left alone");
-    Expect(!fs::exists(downloads / L"desktop.ini"), "a default folder without desktop.ini should stay that way");
+    tagsearch::Tags expected{L"desktop value", L"duplicated"};
+    expected.insert(expected.end(), downloadsOwnTags.begin(), downloadsOwnTags.end());
+    expected.push_back(L"cached A");
+    expected = tagsearch::NormalizeTags(std::move(expected));
+
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 2), expected,
+                "Desktop, Downloads, FolderA, FolderB must independently read or build caches in that order");
+    ExpectEqual(IniValue(desktopIni, summarySection, L"Prop5"), std::wstring(L"31,desktop value;duplicated"),
+                "a valid default cache must be read as-is without rescanning or overwriting");
+    ExpectEqual(tagsearch::SplitKeywords(
+                    std::wstring_view(IniValue(downloadsIni, summarySection, L"Prop5")).substr(3)),
+                downloadsOwnTags, "an uncached Downloads root should write its own tags, not Desktop's tags");
     ExpectEqual(IniValue(secondIni, summarySection, L"Prop5"), std::wstring(L"31,"),
-                "an invalid type should trigger a live scan and a new tag list in the existing file");
+                "a wrong-type Prop5 must be replaced by an independently scanned value");
     ExpectEqual(IniValue(secondIni, L".ShellClassInfo", L"IconResource"), std::wstring(L"folder.ico,0"),
-                "repairing an invalid cache should preserve the custom icon");
+                "repairing an invalid cache must preserve its icon");
+    ExpectReadOnlyFolder(downloads);
+    ExpectReadOnlyFolder(second);
+
+    fs::remove(downloads / L"scanned.jpg");
+    fs::copy_file(fixturePath, second / L"new-file.jpg");
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 2), expected,
+                "all four warm root snapshots must be reused, including defaults and cached emptiness");
+    fs::remove(downloadsIni);
+    auto refreshed = expected;
+    refreshed.erase(std::remove_if(refreshed.begin(), refreshed.end(), [&](const auto& tag) {
+        return std::find(downloadsOwnTags.begin(), downloadsOwnTags.end(), tag) != downloadsOwnTags.end();
+    }), refreshed.end());
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 2), refreshed,
+                "removing only Downloads cache must cause only Downloads to rescan");
+    ExpectEqual(ReadDesktopIniUtf16(downloadsIni),
+                std::wstring(L"\ufeff[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,\r\n"),
+                "the regenerated default cache must not invent ShellClassInfo");
 }
 
 void CombinesWarmAndColdNestedFolders() {
     TestDirectory test;
-    const auto child = test.path / L"Child";
-    fs::create_directory(child);
+    const auto parent = test.path / L"Parent";
+    const auto child = parent / L"Child";
+    fs::create_directories(child);
     const auto childIni = child / L"desktop.ini";
     std::ofstream(childIni) << "[{f29f85e0-4ff9-1068-ab91-08002b27b3d9}]\n"
                               "Prop5 = 31, cached ;cached; child\n";
     fs::copy_file(fixturePath, child / L"live-only.jpg");
-    const auto expected = tagsearch::NormalizeTags({L"cached", L"child"});
-    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({test.path, child}, 0), expected,
-                "a cold parent should reuse a requested child's valid cache without rescanning the child");
-    const auto parentKeywords = IniValue(test.path / L"desktop.ini", summarySection, L"Prop5");
+
+    const auto parentOwnTags = tagsearch::ScanTags({parent});
+    const auto childOwnTags = tagsearch::Tags{L"cached", L"child"};
+    auto expected = parentOwnTags;
+    expected.insert(expected.end(), childOwnTags.begin(), childOwnTags.end());
+    expected = tagsearch::NormalizeTags(std::move(expected));
+
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({parent, child}, 0), expected,
+                "the parent must recursively scan its own files, while the child reuses its valid cache");
+    const auto parentKeywords = IniValue(parent / L"desktop.ini", summarySection, L"Prop5");
     Expect(parentKeywords.starts_with(L"31,"), "the parent should store its own summary value");
-    ExpectEqual(tagsearch::NormalizeTags(tagsearch::SplitKeywords(std::wstring_view(parentKeywords).substr(3))),
-                expected, "the parent snapshot should include the nested cached tags");
+    ExpectEqual(tagsearch::SplitKeywords(std::wstring_view(parentKeywords).substr(3)),
+                parentOwnTags, "the parent cache must not be replaced by the child's cached tag list");
+    ExpectEqual(IniValue(childIni, summarySection, L"Prop5"),
+                std::wstring(L"31, cached ;cached; child"),
+                "the original valid child cache should not be rewritten");
+}
+
+void CacheRequiresCanonicalSummarySection() {
+    TestDirectory test;
+    const auto folder = test.path / L"Folder";
+    fs::create_directory(folder);
+    const auto ini = folder / L"desktop.ini";
+    std::ofstream(ini) << "[.ShellClassInfo]\nIconResource=custom.ico,0\n"
+                          "[Wrong]\nProp5=31,wrong-section-value\n";
+    fs::copy_file(fixturePath, folder / L"original.jpg");
+    const auto actual = tagsearch::ScanTags({folder});
+
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({folder}, 0), actual,
+                "a Prop5 in an unrelated section must never be considered a valid cache");
+    const auto saved = ReadDesktopIniUtf16(ini);
+    Expect(saved.find(L"\r\n[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\r\nProp5=31,") != std::wstring::npos,
+           "the canonical section and its Prop5 must be on two distinct adjacent lines");
+    Expect(saved.find(L"Prop5=31,wrong-section-value") != std::wstring::npos,
+           "repair must preserve unrelated ini fields");
+    ExpectReadOnlyFolder(folder);
 }
 
 void CreateSearchFolderAcceptsMultipleScopesAndLiteralTag() {
@@ -742,7 +820,7 @@ int main(int argc, char** argv) {
         {"split_keywords_basic", SplitKeywordsBasic},
         {"split_keywords_trims_whitespace", SplitKeywordsTrimsWhitespace},
         {"split_keywords_ignores_empty", SplitKeywordsIgnoresEmpty},
-        {"normalize_tags_deduplicates_and_sorts", NormalizeTagsDeduplicatesAndSorts},
+        {"normalize_tags_preserves_first_seen_order", NormalizeTagsPreservesFirstSeenOrder},
         {"normalize_tags_discards_empty", NormalizeTagsDiscardsEmpty},
         {"resolve_folders_keeps_known_folders", ResolveFoldersKeepsKnownFolders},
         {"resolve_folders_accepts_quoted_paths_and_skips_invalid_inputs", ResolveFoldersAcceptsQuotedPathsAndSkipsInvalidInputs},
@@ -750,6 +828,7 @@ int main(int argc, char** argv) {
         {"tag_cache_stores_requested_folders_independently", CachesRequestedFoldersIndependently},
         {"tag_cache_scans_default_roots_live_and_repairs_invalid_cache", ScansDefaultRootsLiveAndRepairsInvalidCache},
         {"tag_cache_combines_warm_and_cold_nested_folders", CombinesWarmAndColdNestedFolders},
+        {"tag_cache_requires_canonical_summary_section", CacheRequiresCanonicalSummarySection},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
         {"overlap_finds_all_direct_intersections", OverlapFindsAllDirectIntersections},
