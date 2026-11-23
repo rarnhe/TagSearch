@@ -4,6 +4,7 @@
 #include <shtypes.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -20,6 +21,19 @@ namespace tagsearch {
 using Folders = std::vector<std::filesystem::path>;
 using Tags = std::vector<std::wstring>;
 using IconResource = std::pair<std::filesystem::path, int>;
+
+struct ScanStatistics {
+    std::uint64_t enumeratedFiles = 0;
+    std::uint64_t propertyStoreCalls = 0;
+    std::uint64_t skippedDirectories = 0;
+    std::uint64_t elapsedMilliseconds = 0;
+    std::uint64_t cachedRoots = 0;
+    std::uint64_t scannedRoots = 0;
+};
+
+// Applies to first-time desktop.ini scans; extension checks are case-insensitive.
+bool ShouldScanTagFile(const std::filesystem::path& path);
+bool ShouldSkipTagDirectory(const std::filesystem::path& path);
 
 Tags SplitKeywords(std::wstring_view value);
 // Stable, first-seen deduplication; never reorder a folder's labels.
@@ -54,7 +68,8 @@ Tags ScanTags(const Folders& folders, std::stop_token stop = {});
 // New default-folder files contain only the summary section; explicit folders use the full template.
 // Callers supply Desktop and Downloads before their additional command-line roots.
 bool EnableFolderDesktopIniCustomization(const std::filesystem::path& folder);
-Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop = {});
+Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount,
+                                 std::stop_token stop = {}, ScanStatistics* statistics = nullptr);
 std::optional<IconResource> ReadDesktopIniIcon(const std::filesystem::path& folder);
 HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result);
 HRESULT CreateTagSearchFolder(const Tags& tags, const Folders& folders, PIDLIST_ABSOLUTE* result);
