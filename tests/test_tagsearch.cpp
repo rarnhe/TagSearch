@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cwctype>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -215,7 +216,7 @@ void CachesRequestedFoldersIndependently() {
     std::ofstream(firstIni) << "[.ShellClassInfo]\nIconResource=folder.ico,0\n"
                               "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp2=31,Folder title\n"
                               "[Other]\nProp5=31,unrelated\n";
-    const auto ownFirst = tagsearch::ScanTags({first});
+    const tagsearch::Tags ownFirst; // JPEG files are excluded from cached scans.
     const tagsearch::Folders folders{desktop, first, second};
     ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache(folders, 1), ownFirst,
                 "all roots should merge in order, without inheriting sibling metadata");
@@ -275,7 +276,7 @@ void CachesDefaultRootsAndRepairsInvalidCache() {
                                 "[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]\nProp5=19,invalid cache\n";
     fs::copy_file(fixturePath, desktop / L"ignored-because-cached.jpg");
     fs::copy_file(fixturePath, downloads / L"scanned.jpg");
-    const auto downloadsOwnTags = tagsearch::ScanTags({downloads});
+    const tagsearch::Tags downloadsOwnTags; // JPEG is not in the document whitelist.
     const tagsearch::Folders folders{desktop, downloads, first, second};
     tagsearch::Tags expected{L"desktop value", L"duplicated"};
     expected.insert(expected.end(), downloadsOwnTags.begin(), downloadsOwnTags.end());
@@ -322,7 +323,7 @@ void KeepsParentAndChildSnapshotsSeparate() {
                               "Prop5 = 31, cached ;cached; child\n";
     fs::copy_file(fixturePath, child / L"live-only.jpg");
 
-    const auto parentOwnTags = tagsearch::ScanTags({parent});
+    const tagsearch::Tags parentOwnTags; // Nested JPEG file is excluded.
     const auto childOwnTags = tagsearch::Tags{L"cached", L"child"};
     auto expected = parentOwnTags;
     expected.insert(expected.end(), childOwnTags.begin(), childOwnTags.end());
@@ -357,6 +358,61 @@ void CacheRequiresCanonicalSummarySection() {
     Expect(saved.find(L"Prop5=31,wrong-section-value") != std::wstring::npos,
            "repair must preserve unrelated ini fields");
     ExpectReadOnlyFolder(folder);
+}
+
+void ScanWhitelistSkipsOtherFilesAndDotFolders() {
+    TestDirectory test;
+    const auto root = test.path / L"Root";
+    const auto visible = root / L"ordinary";
+    const auto hidden = root / L".git";
+    fs::create_directories(visible);
+    fs::create_directory(hidden);
+
+    const std::array<std::wstring_view, 7> extensions{
+        L".xls", L".ppt", L".doc", L".pptx", L".xlsx", L".pdf", L".docx"
+    };
+    for (const auto extension : extensions) {
+        const fs::path file = visible / (std::wstring(L"sample") + std::wstring(extension));
+        std::ofstream(file).put('x');
+        Expect(tagsearch::ShouldScanTagFile(file), "every permitted document type must be accepted");
+        auto upper = file;
+        auto name = upper.filename().wstring();
+        std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return std::towupper(c); });
+        upper.replace_filename(name);
+        Expect(tagsearch::ShouldScanTagFile(upper), "uppercase extensions must be accepted");
+    }
+    for (const auto extension : {L".jpg", L".png", L".txt", L".exe", L".dll", L".tmp", L".ini"}) {
+        const fs::path file = visible / (std::wstring(L"ignored") + extension);
+        std::ofstream(file).put('x');
+        Expect(!tagsearch::ShouldScanTagFile(file), "other extensions must not be scanned");
+    }
+    fs::copy_file(fixturePath, visible / L"ignored.jpg", fs::copy_options::overwrite_existing);
+    std::ofstream(hidden / L"buried.pdf").put('x');
+    Expect(tagsearch::ShouldSkipTagDirectory(hidden), "dot-directories should be skipped");
+    Expect(!tagsearch::ShouldSkipTagDirectory(visible), "ordinary directories should be traversed");
+
+    tagsearch::ScanStatistics cold;
+    const auto result = tagsearch::ScanTagsWithDesktopIniCache({root}, 0, {}, &cold);
+    Expect(result.empty(), "JPEG tags and dummy documents must not provide visible labels");
+    ExpectEqual(cold.enumeratedFiles, std::uint64_t{14},
+                "file count should include rejected files from traversed directories");
+    ExpectEqual(cold.propertyStoreCalls, std::uint64_t{9},
+                "Property Store should be called only for two directories plus seven document files");
+    ExpectEqual(cold.skippedDirectories, std::uint64_t{1}, "the .git subtree should be excluded");
+    Expect(cold.scannedRoots == 1 && cold.cachedRoots == 0, "first launch must scan");
+
+    tagsearch::ScanStatistics warm;
+    ExpectEqual(tagsearch::ScanTagsWithDesktopIniCache({root}, 0, {}, &warm), result,
+                "a subsequent launch must reuse cached values");
+    Expect(warm.enumeratedFiles == 0 && warm.propertyStoreCalls == 0 &&
+           warm.skippedDirectories == 0 && warm.cachedRoots == 1 && warm.scannedRoots == 0,
+           "cached launch must bypass enumeration and Property Store");
+
+    tagsearch::ScanStatistics dotRoot;
+    Expect(tagsearch::ScanTagsWithDesktopIniCache({hidden}, 0, {}, &dotRoot).empty() &&
+           dotRoot.skippedDirectories == 1 && dotRoot.propertyStoreCalls == 0 &&
+           !fs::exists(hidden / L"desktop.ini"),
+           "explicit dot-folders must not be scanned or cached");
 }
 
 void CreateSearchFolderAcceptsMultipleScopesAndLiteralTag() {
@@ -829,6 +885,7 @@ int main(int argc, char** argv) {
         {"tag_cache_default_roots_use_cache_and_repair_invalid_cache", CachesDefaultRootsAndRepairsInvalidCache},
         {"tag_cache_nested_roots_keep_independent_snapshots", KeepsParentAndChildSnapshotsSeparate},
         {"tag_cache_requires_canonical_summary_section", CacheRequiresCanonicalSummarySection},
+        {"scan_whitelist_skips_other_files_and_dot_folders", ScanWhitelistSkipsOtherFilesAndDotFolders},
         {"create_search_folder_accepts_multiple_scopes_and_literal_tag", CreateSearchFolderAcceptsMultipleScopesAndLiteralTag},
         {"create_search_folder_rejects_empty_scope", CreateSearchFolderRejectsEmptyScope},
         {"overlap_finds_all_direct_intersections", OverlapFindsAllDirectIntersections},

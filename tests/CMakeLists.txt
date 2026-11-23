@@ -24,6 +24,7 @@ set(cases
     tag_cache_default_roots_use_cache_and_repair_invalid_cache
     tag_cache_nested_roots_keep_independent_snapshots
     tag_cache_requires_canonical_summary_section
+    scan_whitelist_skips_other_files_and_dot_folders
     create_search_folder_accepts_multiple_scopes_and_literal_tag
     create_search_folder_rejects_empty_scope
     overlap_finds_all_direct_intersections
