@@ -139,32 +139,16 @@ COLORREF WindowAccentColor() {
 }
 
 Tags NormalizeTags(Tags tags) {
+    // Preserve the first-seen order, including the order inside a cached Prop5 list.
     std::set<std::wstring> distinct;
+    Tags normalized;
+    normalized.reserve(tags.size());
     for (const auto& tag : tags) {
-        std::wstring trimmed = TrimWhitespace(tag);
-        if (!trimmed.empty()) {
-            distinct.insert(std::move(trimmed));
+        auto trimmed = TrimWhitespace(tag);
+        if (!trimmed.empty() && distinct.insert(trimmed).second) {
+            normalized.push_back(std::move(trimmed));
         }
     }
-
-    Tags normalized(distinct.begin(), distinct.end());
-
-    try {
-        const std::locale userLocale("");
-        const auto& collate = std::use_facet<std::collate<wchar_t>>(userLocale);
-        std::sort(
-            normalized.begin(),
-            normalized.end(),
-            [&collate](const std::wstring& left, const std::wstring& right) {
-                return collate.compare(
-                    left.data(), left.data() + left.size(),
-                    right.data(), right.data() + right.size()) < 0;
-            });
-    }
-    catch (...) {
-        std::sort(normalized.begin(), normalized.end());
-    }
-
     return normalized;
 }
 
@@ -181,6 +165,14 @@ Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCou
         AddFolder(folders, arguments.get()[i]);
     }
     return folders;
+}
+
+bool EnableFolderDesktopIniCustomization(const fs::path& folder) {
+    const DWORD attributes = GetFileAttributesW(folder.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    if (attributes & FILE_ATTRIBUTE_READONLY) return true;
+    // The directory's +R bit opts into Explorer's desktop.ini customization.
+    return SetFileAttributesW(folder.c_str(), attributes | FILE_ATTRIBUTE_READONLY) != FALSE;
 }
 
 namespace {
@@ -314,7 +306,7 @@ std::optional<Tags> ReadCachedTags(const DesktopIni& ini, const IniEntry& entry)
 }
 
 void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniEntry& entry,
-                    const Tags& tags, std::stop_token stop) {
+                    const Tags& tags, bool defaultFolder, std::stop_token stop) {
     // The Windows Prop5 list has no escape syntax for semicolons or line breaks.
     constexpr std::wstring_view unsupported(L";\r\n\0", 4);
     constexpr std::wstring_view prefix = L"Prop5=31,";
@@ -326,7 +318,7 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniE
     }
 
     auto text = original.text;
-    if (text.empty()) {
+    if (text.empty() && !defaultFolder) {
         text = kShellClassInfo;
         text += L"\r\nInfoTip=\r\nIconResource=\r\n";
     }
@@ -359,6 +351,8 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniE
         written == length && FlushFileBuffers(file);
     CloseHandle(file);
 
+    // Only mark the folder customized after its desktop.ini is safely committed.
+    bool committed = false;
     // If another program edited desktop.ini during the scan, leave that version in place.
     if (ready && !stop.stop_requested()) {
         const auto current = ReadDesktopIni(path);
@@ -371,18 +365,22 @@ void SaveCachedTags(const fs::path& path, const DesktopIni& original, const IniE
                     auto backup = temp;
                     backup += L".bak";
                     if (ReplaceFileW(path.c_str(), temp.c_str(), backup.c_str(), 0, nullptr, nullptr)) {
+                        committed = true;
                         DeleteFileW(backup.c_str());
                     } else if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES &&
                                GetLastError() == ERROR_FILE_NOT_FOUND) {
-                        MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+                        committed = MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
                     }
                 }
             } else {
-                MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+                committed = MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
             }
         }
     }
     DeleteFileW(temp.c_str());
+    if (committed && EnableFolderDesktopIniCustomization(path.parent_path())) {
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, path.parent_path().c_str(), nullptr);
+    }
 }
 
 Tags ScanTagsWithSnapshots(const Folders& folders, const FolderSnapshots& snapshots,
@@ -475,34 +473,48 @@ Tags ScanTags(const Folders& folders, std::stop_token stop) {
 }
 
 Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop) {
-    const auto requestedFolders = std::span(folders).subspan(defaultCount);
-    Folders ordered(requestedFolders.begin(), requestedFolders.end());
-    // Resolve children first so a parent scan can reuse any explicitly requested child snapshot.
-    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-        return left.native().size() > right.native().size();
-    });
+    // Keep each root independent: every snapshot contains only that root's recursive
+    // tags, never a union of other requested roots. The root order is the caller's
+    // order (Desktop, Downloads, then command-line folders).
+    struct PerFolderTags {
+        fs::path folder;
+        Tags tags;
+    };
+    std::vector<PerFolderTags> perFolder;
+    perFolder.reserve(folders.size());
 
-    FolderSnapshots snapshots;
-    for (const auto& folder : ordered) {
+    for (std::size_t index = 0; index < folders.size(); ++index) {
         if (stop.stop_requested()) return {};
-        const auto path = folder / kDesktopIniName;
-        const auto original = ReadDesktopIni(path);
+        const auto& folder = folders[index];
+        const auto iniPath = folder / kDesktopIniName;
+        const auto original = ReadDesktopIni(iniPath);
         IniEntry entry;
+        Tags tags;
+        bool cached = false;
         if (original) {
             entry = FindIniEntry(original->text, kSummarySection, L"Prop5");
-            if (auto cached = ReadCachedTags(*original, entry)) {
-                snapshots.emplace(folder, FolderSnapshot{std::move(*cached), true});
-                continue;
+            if (auto saved = ReadCachedTags(*original, entry)) {
+                tags = std::move(*saved);
+                cached = true;
             }
         }
-        bool complete = true;
-        auto tags = ScanTagsWithSnapshots({folder}, snapshots, stop, &complete);
-        if (original && complete && !stop.stop_requested()) {
-            SaveCachedTags(path, *original, entry, tags, stop);
+        if (!cached) {
+            bool complete = true;
+            // Scan each root on its own. Nested explicit roots cannot replace the
+            // parent's own complete snapshot with a stale child snapshot.
+            tags = ScanTagsWithSnapshots({folder}, {}, stop, &complete);
+            if (original && complete && !stop.stop_requested()) {
+                SaveCachedTags(iniPath, *original, entry, tags, index < defaultCount, stop);
+            }
         }
-        snapshots.emplace(folder, FolderSnapshot{std::move(tags), complete});
+        perFolder.push_back({folder, std::move(tags)});
     }
-    return ScanTagsWithSnapshots(folders, snapshots, stop);
+
+    Tags combined;
+    for (const auto& snapshot : perFolder) {
+        combined.insert(combined.end(), snapshot.tags.begin(), snapshot.tags.end());
+    }
+    return stop.stop_requested() ? Tags{} : NormalizeTags(std::move(combined));
 }
 
 std::vector<TagSearchTerm> TermsForOverlappingWindows(

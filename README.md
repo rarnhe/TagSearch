@@ -15,7 +15,7 @@ TagSearch_Caption.exe C:\Work\repos "D:\Project Files"
 - **Caption** 启动后在后台扫描，扫描完成后在主屏工作区随机分布全部标签。每个浮动窗口只显示标题，左右各留约 4 个逻辑像素，圆角边框跟随 Windows 主题强调色。标题笔画透出窗口背后的内容，左键按下或拖动时加粗，松开恢复常规字重。单击打开搜索，拖动在主屏工作区内移动标签。排布优先使用互不重叠的位置，空间不足时仍显示全部窗口并通过 Windows 系统通知提示「可能发生重叠的标签个数」。同一窗口只计一次。扫描未找到标签时自动退出。
 - 标签窗口默认浅绿色。右键选择 AND、OR 或 NOT，分别显示浅绿色、粉色或灰色。拖动标签使窗口重叠，再点击其中一个执行搜索。同一组标签按 AND、OR、NOT 的顺序组成查询，操作符从左到右绑定。查询 `AND tagA OR tagB NOT tagC` 表示 `(tagA OR tagB) AND NOT tagC`。Esc 可退出。
 - 递归扫描读取根目录、子目录和文件的 Shell 属性。未公开 `System.Keywords` 的项目不会提供标签。扫描跳过无法访问的目录，也不会进入扫描过程中遇到的目录联接或目录符号链接。
-- **TreeView 和 Caption 的目录缓存**。桌面和下载始终实时扫描，标签缓存只用于命令行新增的目录。参数目录缺少 `desktop.ini` 时，递归扫描后创建文件，写入 `[.ShellClassInfo]` 的 `InfoTip=`、`IconResource=`，以及摘要信息节的 `Prop5=31,标签1;标签2`。已有 `desktop.ini` 但摘要信息节缺少有效的 `Prop5=31,` 时，同样扫描并写入该项，保留图标等原有配置。已有有效标签缓存时直接读取，空标签列表也是有效缓存。桌面、下载和各参数目录的标签合并去重后显示。
+- **TreeView 和 Caption 的目录缓存**。Desktop、Downloads 及命令行指定的 FolderA、FolderB 等目录依次各自拥有独立的标签列表。每个目录优先读取自己 `desktop.ini` 中固定的 `[{F29F85E0-4FF9-1068-AB91-08002B27B3D9}]` 节及下一行 `Prop5=31,标签1;标签2`；缺少文件、节或有效字段才递归扫描该目录的全部文件和子目录，按发现顺序去重并缓存（包括空列表）。默认 Desktop／Downloads 缺失缓存时仅补写上述两行，不另外创建 `.ShellClassInfo`；新参数目录则按 `[.ShellClassInfo]`、`InfoTip=`、`IconResource=`、摘要节、`Prop5=31,` 的模板生成。原 `desktop.ini` 的其他设置不会被抹掉。成功写入后为文件夹设置 Windows `+R` 自定义属性。所有目录缓存按输入顺序合并、再次去重，**不重新排序**，然后供 TreeView 和 Caption 显示。
 - Explorer 使用同一组已解析目录作为搜索范围，结果取决于 Windows Search 和对应文件类型的属性处理程序。
 
 ## 架构

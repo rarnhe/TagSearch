@@ -22,6 +22,7 @@ using Tags = std::vector<std::wstring>;
 using IconResource = std::pair<std::filesystem::path, int>;
 
 Tags SplitKeywords(std::wstring_view value);
+// Stable, first-seen deduplication; never reorder a folder's labels.
 Tags NormalizeTags(Tags tags);
 COLORREF WindowAccentColor();
 
@@ -49,7 +50,10 @@ Folders ResolveSearchFolders(const wchar_t* commandLine, std::size_t* defaultCou
 
 // Call Shell operations from a thread with COM initialized.
 Tags ScanTags(const Folders& folders, std::stop_token stop = {});
-// The first defaultCount roots are scanned live; remaining roots may use desktop.ini snapshots.
+// All roots, including default folders, use their own desktop.ini snapshots when valid.
+// New default-folder files contain only the summary section; explicit folders use the full template.
+// Callers supply Desktop and Downloads before their additional command-line roots.
+bool EnableFolderDesktopIniCustomization(const std::filesystem::path& folder);
 Tags ScanTagsWithDesktopIniCache(const Folders& folders, std::size_t defaultCount, std::stop_token stop = {});
 std::optional<IconResource> ReadDesktopIniIcon(const std::filesystem::path& folder);
 HRESULT CreateTagSearchCondition(const Tags& tags, ICondition** result);
