@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -271,17 +272,11 @@ void CheckTerminalScanStatistics(const fs::path& executable) {
         FILE_SHARE_READ | FILE_SHARE_WRITE, &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     Expect(output != INVALID_HANDLE_VALUE, "the test needs a redirected standard output");
 
-    try {
-        const Process process(copy.executable, {copy.directory}, output);
-        CloseHandle(output);
-        const HWND panel = WaitForPanel(process);
-        WaitForTitle(panel, copy.directory.filename().wstring());
-        ClosePanel(panel, process);
-    } catch (...) {
-        // A close is harmless if the handle was already closed by CreateProcess.
-        // The caller's RAII process object still terminates on exceptions.
-        throw;
-    }
+    const Process process(copy.executable, {copy.directory}, output);
+    CloseHandle(output);
+    const HWND panel = WaitForPanel(process);
+    WaitForTitle(panel, copy.directory.filename().wstring());
+    ClosePanel(panel, process);
 
     std::ifstream report(logPath, std::ios::binary);
     const std::string result(std::istreambuf_iterator<char>{report}, std::istreambuf_iterator<char>{});
