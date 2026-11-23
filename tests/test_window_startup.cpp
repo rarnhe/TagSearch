@@ -424,9 +424,23 @@ void CheckCaptionLayout(const fs::path& executable, const fs::path& fixture) {
     const DWORD threadId = GetWindowThreadProcessId(controller, nullptr);
     Expect(WaitUntil([&] {
         ReadVisibleCaptionTags(threadId, tags);
-        return std::find(tags.titles.begin(), tags.titles.end(), L"alpha") != tags.titles.end() &&
-               std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") != tags.titles.end();
-    }), "the background scan should display the two cached labels");
+        if (std::find(tags.titles.begin(), tags.titles.end(), L"alpha") == tags.titles.end() ||
+            std::find(tags.titles.begin(), tags.titles.end(), L"项目 & 资料") == tags.titles.end()) {
+            return false;
+        }
+        // A visible window can appear during its initial DWM/client-area update.
+        // Check settled window dimensions before inspecting the final layout.
+        for (std::size_t i = 0; i < tags.windows.size(); ++i) {
+            RECT current{}, client{};
+            if (!GetWindowRect(tags.windows[i], &current) || !GetClientRect(tags.windows[i], &client) ||
+                !EqualRect(&current, &tags.bounds[i]) ||
+                client.right != current.right - current.left ||
+                client.bottom != current.bottom - current.top) {
+                return false;
+            }
+        }
+        return true;
+    }), "the background scan should display and lay out the two cached labels");
     Expect(!tags.unexpectedVisibleWindow && !IsWindowVisible(controller),
            "only real tag windows should be visible after the scan");
     CheckTagBounds(tags, monitor.rcWork);
